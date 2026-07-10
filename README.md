@@ -1,4 +1,4 @@
-# Real Estate Cinematic Video Generator
+# MultiModal Video Orchestrator
 
 A **local-first web app** that turns 10–40 property photos into a single cinematic
 real-estate tour video with almost no user input:
