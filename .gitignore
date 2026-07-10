@@ -1,0 +1,18 @@
+node_modules/
+dist/
+projects/
+test-photos/
+.env
+*.log
+.DS_Store
+Thumbs.db
+test-photos-real/
+
+# Machine-local Claude Code settings (the committed skills/ stay tracked)
+.claude/settings.local.json
+
+# Playwright MCP session artifacts
+.playwright-mcp/
+
+# Stray empty git repo — not part of this project
+Multimodal-Video-Orchestrator/

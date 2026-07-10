@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@rev/core": ["packages/core/src/index.ts"],
+      "@rev/engine-upload": ["packages/engine-upload/src/index.ts"],
+      "@rev/engine-vision": ["packages/engine-vision/src/index.ts"],
+      "@rev/engine-storyboard": ["packages/engine-storyboard/src/index.ts"],
+      "@rev/engine-prompt": ["packages/engine-prompt/src/index.ts"],
+      "@rev/engine-videogen": ["packages/engine-videogen/src/index.ts"],
+      "@rev/engine-render": ["packages/engine-render/src/index.ts"],
+      "@rev/orchestrator": ["packages/orchestrator/src/index.ts"]
+    }
+  },
+  "include": ["packages/**/*.ts", "scripts/**/*.ts", "apps/server/src/**/*.ts"]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "real-estate-video-generator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "demo": "tsx scripts/demo.ts",
+    "analyze": "tsx scripts/analyze.ts",
+    "storyboard": "tsx scripts/storyboard-preview.ts",
+    "render": "tsx scripts/render.ts",
+    "test": "tsx --test packages/engine-storyboard/src/index.test.ts packages/engine-prompt/src/index.test.ts packages/engine-videogen/src/higgsfield.test.ts packages/engine-render/src/ffmpeg.test.ts packages/orchestrator/src/index.test.ts apps/server/src/routes/runs.test.ts",
+    "dev:server": "tsx watch apps/server/src/main.ts",
+    "dev:web": "npm run dev -w @rev/web",
+    "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
