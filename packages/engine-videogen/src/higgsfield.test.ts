@@ -139,6 +139,53 @@ test('transient submit failure is retried within the shot', async () => {
   assert.equal(out[0].status, 'done');
 });
 
+test('a transient upload-url failure is retried before a job is created', async () => {
+  const { workDir, assets, shots } = await setup(1);
+  let uploadLinkCalls = 0;
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith('/files/generate-upload-url')) {
+      uploadLinkCalls++;
+      if (uploadLinkCalls === 1) return new Response('<html>502</html>', { status: 502 });
+      return Response.json({ upload_url: 'https://uploads.example/put/0', public_url: 'https://cdn.example/img/0.jpg' });
+    }
+    if (init?.method === 'PUT') return new Response(null, { status: 200 });
+    if (init?.method === 'POST') return Response.json({ request_id: 'req_ok' });
+    if (u.includes('/requests/')) return Response.json({ status: 'completed', video: { url: 'https://cdn.example/x.mp4' } });
+    return new Response(CLIP_BYTES, { status: 200 });
+  }) as typeof fetch;
+
+  const out = await makeEngine(fetchImpl).process({ shots, assets }, makeCtx(workDir));
+  assert.equal(out[0].status, 'done', 'retry after the 502 succeeds');
+  assert.equal(uploadLinkCalls, 2, 'upload-url was retried exactly once');
+});
+
+test('a poll timeout is NEVER resubmitted (no double-billing)', async () => {
+  const { workDir, assets, shots } = await setup(1);
+  let submits = 0;
+  // Submit always succeeds; polling always says in_progress -> forces a timeout.
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith('/files/generate-upload-url')) {
+      return Response.json({ upload_url: 'https://uploads.example/put/0', public_url: 'https://cdn.example/img/0.jpg' });
+    }
+    if (init?.method === 'PUT') return new Response(null, { status: 200 });
+    if (init?.method === 'POST') { submits++; return Response.json({ request_id: `req_${submits}` }); }
+    if (u.includes('/requests/')) return Response.json({ status: 'in_progress' });
+    return new Response(CLIP_BYTES, { status: 200 });
+  }) as typeof fetch;
+
+  // maxAttempts 3 would resubmit thrice under the old logic; the split must
+  // submit exactly once because the failure is in the (billable) poll phase.
+  // The lone shot fails, so process() rejects (all clips failed) — that's fine;
+  // the point under test is that only ONE billable job was ever created.
+  const engine = new HiggsfieldVideoGenEngine({
+    apiKey: 'k:s', pollIntervalMs: 1, maxPollMs: 20, maxAttempts: 3, fetchImpl,
+  });
+  await assert.rejects(engine.process({ shots, assets }, makeCtx(workDir)), /All 1 clip generations failed/);
+  assert.equal(submits, 1, 'exactly one billable job created despite maxAttempts=3');
+});
+
 test('a persistently failing shot is isolated, not fatal', async () => {
   const { workDir, assets, shots } = await setup(3);
   const api = fakeApi({ failRooms: new Set(['prompt_1']) }); // shot 1 always fails

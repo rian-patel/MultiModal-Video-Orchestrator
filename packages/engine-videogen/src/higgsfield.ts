@@ -66,7 +66,11 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     // Higgsfield starter plans allow max 2 concurrent jobs (observed live).
     this.maxConcurrency = opts.maxConcurrency ?? 2;
     this.pollIntervalMs = opts.pollIntervalMs ?? 5_000;
-    this.maxPollMs = opts.maxPollMs ?? 6 * 60_000;
+    // dop/standard is usually a few min but has been seen near ~16 min under
+    // load; keep the ceiling well above that so a slow-but-fine clip is never
+    // falsely timed out (a timeout no longer resubmits, but it does lose the
+    // paid clip). See generateShot for the retry split.
+    this.maxPollMs = opts.maxPollMs ?? 20 * 60_000;
     this.maxAttempts = opts.maxAttempts ?? 2;
     this.fetch = opts.fetchImpl ?? fetch;
   }
@@ -112,20 +116,35 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
       return { ...out, status: 'failed' };
     }
 
+    // Phase 1 — obtain a request_id (upload image + submit). RETRYABLE: a
+    // failure here (e.g. a transient 502 from the CDN upload endpoint) happens
+    // before any billable job exists, so retrying costs nothing.
+    let requestId: string | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       try {
-        const requestId = await this.submit(sourcePath, shot, ctx);
-        out.higgsfieldJobId = requestId;
-        const videoUrl = await this.pollUntilDone(requestId);
-        const clipPath = join(clipsDir, `shot-${String(shot.order).padStart(2, '0')}.mp4`);
-        await this.download(videoUrl, clipPath);
-        return { ...out, clipPath, status: 'done' };
+        requestId = await this.submit(sourcePath, shot, ctx);
+        break;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
-        ctx.logger.warn(`Shot ${shot.order} attempt ${attempt}/${this.maxAttempts} failed: ${reason}`);
+        ctx.logger.warn(`Shot ${shot.order} submit attempt ${attempt}/${this.maxAttempts} failed: ${reason}`);
       }
     }
-    return { ...out, status: 'failed' };
+    if (!requestId) return { ...out, status: 'failed' };
+    out.higgsfieldJobId = requestId;
+
+    // Phase 2 — poll + download. NOT retried: the job is now billable, so a
+    // poll timeout must never resubmit (that would double-charge). One shot →
+    // at most one billed clip, regardless of maxAttempts.
+    try {
+      const videoUrl = await this.pollUntilDone(requestId);
+      const clipPath = join(clipsDir, `shot-${String(shot.order).padStart(2, '0')}.mp4`);
+      await this.download(videoUrl, clipPath);
+      return { ...out, clipPath, status: 'done' };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      ctx.logger.warn(`Shot ${shot.order} generation failed (job ${requestId}, not resubmitted): ${reason}`);
+      return { ...out, status: 'failed' };
+    }
   }
 
   private async submit(sourcePath: string, shot: Shot, ctx: EngineContext): Promise<string> {
