@@ -25,6 +25,11 @@ interface SubmitResponse {
   id?: string;
 }
 
+interface UploadLinkResponse {
+  upload_url?: string;
+  public_url?: string;
+}
+
 interface StatusResponse {
   status: 'queued' | 'in_progress' | 'completed' | 'failed' | 'nsfw';
   video?: { url?: string } | null;
@@ -34,11 +39,14 @@ interface StatusResponse {
 /**
  * Real VideoGen engine against the Higgsfield platform REST API
  * (https://platform.higgsfield.ai — fal-style queue):
- *   POST /{model}  { image_url, prompt, duration }  -> { request_id }
- *   GET  /requests/{id}/status                      -> { status, video.url }
- * Per shot: image -> data URI -> submit -> poll -> download to workDir/clips.
- * Failures are isolated per shot (status 'failed'); the run only fails when
- * every clip fails.
+ *   POST /files/generate-upload-url { content_type } -> { upload_url, public_url }
+ *   PUT  {upload_url} (raw image bytes)              -> (image now hosted)
+ *   POST /{model}  { image_url, prompt, duration }   -> { request_id }
+ *   GET  /requests/{id}/status                       -> { status, video.url }
+ * Per shot: upload image -> hosted URL -> submit -> poll -> download to
+ * workDir/clips. (image_url must be a real URL ≤2083 chars, NOT a data URI —
+ * the platform rejects data URIs with 422 url_too_long.) Failures are isolated
+ * per shot (status 'failed'); the run only fails when every clip fails.
  */
 export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
   readonly name = 'videogen:higgsfield';
@@ -121,9 +129,10 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
   }
 
   private async submit(sourcePath: string, shot: Shot, ctx: EngineContext): Promise<string> {
-    // Local-first app: photos aren't publicly reachable, so send a data URI
-    // (fal-style APIs accept these for image_url).
-    const image = await readFile(sourcePath);
+    // Local-first app: photos aren't publicly reachable, and the platform
+    // rejects data URIs (422 url_too_long, 2083-char cap). So upload the image
+    // to Higgsfield's CDN first and submit the returned hosted URL.
+    const imageUrl = await this.uploadImage(sourcePath);
     const res = await this.fetch(`${this.baseUrl}/${this.model}`, {
       method: 'POST',
       headers: {
@@ -131,7 +140,7 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        image_url: `data:image/jpeg;base64,${image.toString('base64')}`,
+        image_url: imageUrl,
         prompt: shot.prompt ?? 'Slow cinematic dolly-in. Photoreal, no people.',
         duration: Math.max(1, Math.ceil(ctx.config.clipDurationSec)),
       }),
@@ -143,6 +152,39 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     const id = body.request_id ?? body.id;
     if (!id) throw new Error('submit response had no request_id');
     return id;
+  }
+
+  /**
+   * Two-step upload to the Higgsfield CDN (matches the official SDK):
+   * ask for a presigned URL, PUT the bytes to it, return the public URL.
+   */
+  private async uploadImage(sourcePath: string): Promise<string> {
+    const bytes = await readFile(sourcePath);
+    const linkRes = await this.fetch(`${this.baseUrl}/files/generate-upload-url`, {
+      method: 'POST',
+      headers: {
+        authorization: `Key ${this.apiKey}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ content_type: 'image/jpeg' }),
+    });
+    if (!linkRes.ok) {
+      throw new Error(`upload-url failed: HTTP ${linkRes.status} ${(await linkRes.text()).slice(0, 200)}`);
+    }
+    const { upload_url, public_url } = (await linkRes.json()) as UploadLinkResponse;
+    if (!upload_url || !public_url) {
+      throw new Error('upload-url response missing upload_url/public_url');
+    }
+    // Presigned PUT: auth is embedded in the URL, so only Content-Type is sent.
+    const putRes = await this.fetch(upload_url, {
+      method: 'PUT',
+      headers: { 'content-type': 'image/jpeg' },
+      body: bytes,
+    });
+    if (!putRes.ok) {
+      throw new Error(`image upload PUT failed: HTTP ${putRes.status}`);
+    }
+    return public_url;
   }
 
   private async pollUntilDone(requestId: string): Promise<string> {

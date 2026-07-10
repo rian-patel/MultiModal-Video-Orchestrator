@@ -42,21 +42,44 @@ async function setup(shotCount: number) {
 const CLIP_BYTES = Buffer.from('fake-mp4-bytes');
 
 /**
- * Fake platform API: submit -> request_id, one in_progress poll, then
- * completed with a download URL. `failSubmits` makes the first N submit
- * calls return HTTP 500; `alwaysFail` marks specific request ids failed.
+ * Fake platform API modelling the real flow: image upload (get presigned URL,
+ * PUT bytes) -> submit -> request_id -> one in_progress poll -> completed with
+ * a download URL. `failSubmits` makes the first N submit calls return HTTP 500;
+ * `failRooms` marks matching request ids failed.
  */
 function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
   let submitCount = 0;
+  let uploadCount = 0;
   let failSubmitsLeft = opts.failSubmits ?? 0;
   const polls = new Map<string, number>();
   const submittedPrompts: string[] = [];
+  const putUploads: string[] = [];
 
   const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
+    // 1. presigned upload URL
+    if (u.endsWith('/files/generate-upload-url')) {
+      const n = uploadCount++;
+      return Response.json({
+        upload_url: `https://uploads.example/put/${n}`,
+        public_url: `https://cdn.example/img/${n}.jpg`,
+      });
+    }
+    // 2. PUT the raw bytes to the presigned URL
+    if (init?.method === 'PUT') {
+      assert.equal(
+        (init.headers as Record<string, string>)['content-type'],
+        'image/jpeg',
+        'image PUT uses image/jpeg',
+      );
+      putUploads.push(u);
+      return new Response(null, { status: 200 });
+    }
+    // 3. submit generation
     if (init?.method === 'POST') {
       const body = JSON.parse(String(init.body)) as { prompt: string; image_url: string };
-      assert.match(body.image_url, /^data:image\/jpeg;base64,/, 'image sent as data URI');
+      assert.match(body.image_url, /^https:\/\/cdn\.example\/img\//, 'image_url is the hosted URL');
+      assert.ok(body.image_url.length <= 2083, 'image_url within the platform URL limit');
       if (failSubmitsLeft > 0) {
         failSubmitsLeft--;
         return new Response('boom', { status: 500 });
@@ -79,7 +102,7 @@ function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
     return new Response(CLIP_BYTES, { status: 200 });
   }) as typeof fetch;
 
-  return { fetchImpl, submittedPrompts };
+  return { fetchImpl, submittedPrompts, putUploads };
 }
 
 function makeEngine(fetchImpl: typeof fetch, extra: Record<string, unknown> = {}) {
@@ -106,6 +129,7 @@ test('happy path: submits prompt, polls to completion, downloads clip', async ()
     assert.deepEqual(bytes, CLIP_BYTES, 'clip bytes written to disk');
   }
   assert.deepEqual(api.submittedPrompts.sort(), ['prompt 0', 'prompt 1', 'prompt 2']);
+  assert.equal(api.putUploads.length, 3, 'each shot uploaded its image before submit');
 });
 
 test('transient submit failure is retried within the shot', async () => {
