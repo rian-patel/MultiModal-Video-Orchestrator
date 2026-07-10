@@ -72,7 +72,6 @@ function project(stage: Project['stage']): Project {
     id: 'proj_x',
     createdAt: new Date().toISOString(),
     targetDurationSec: 30,
-    mode: 'faithful',
     stage,
     assets: [],
     vision: [],

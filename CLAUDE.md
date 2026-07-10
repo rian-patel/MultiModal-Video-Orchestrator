@@ -46,7 +46,7 @@ Upload → Vision → Storyboard → Prompt → VideoGen → Render → download
 | **Vision** | `Asset[]` → `VisionResult[]` | Claude vision | local CLIP, GPT-4V |
 | **Storyboard** | `{assets,vision,targetDurationSec}` → `Shot[]` | rule-based order + **select best N** + durations | LLM narrative order |
 | **Prompt** | `{shots,vision}` → `Shot[]` | vision-move + room-variant composer (see Phase 4 notes) | LLM prompts |
-| **VideoGen** | `{shots,assets}` → `Shot[]` | **Ken Burns (faithful, default)** / Higgsfield (cinematic, opt-in) | Runway/Kling/Luma |
+| **VideoGen** | `{shots,assets}` → `Shot[]` | Higgsfield (submit/poll/download) | Runway/Kling/Luma |
 | **Render** | `{shots,outputPath}` → `RenderResult` | FFmpeg | Remotion |
 
 ### The Engine contract (`@rev/core`)
@@ -95,11 +95,10 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
 ```
 
 ### Server API (stable shape)
-- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: 'ken-burns', cinematicAvailable: boolean } }` — faithful is always the default; `cinematicAvailable` = Higgsfield key present. UI header displays it.
-- `POST /api/runs` — two content types. Both accept a **review** flag (multipart
-  `review=1` / JSON `review:true` → pause at 'prompted', emit SSE `review`, no spend
-  until approval) and a **mode** field (`faithful` default | `cinematic`; multipart
-  `mode=` / JSON `mode:` → faithful=Ken Burns, cinematic=Higgsfield-if-keyed):
+- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
+- `POST /api/runs` — two content types (both accept a **review** flag: multipart field
+  `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
+  SSE `review` instead of animating straight through — no clip spend until approval):
   - `multipart/form-data`: real photos. Fields: `targetDurationSec` (30|45|60) +
     `photos` file parts (10–40, ≤30 MB each). Streamed to `%TMP%/rev-uploads/<id>/`,
     run through the real `LocalUploadEngine` (engine override), temp dir removed
@@ -152,50 +151,38 @@ Per photo: sharp `.rotate()` (applies EXIF orientation) → normalized JPEG q92 
 in `workDir/thumbs/`. Downstream engines can assume upright, consistent JPEGs.
 Non-image bytes fail the run with a per-file message.
 
-## Fidelity: faithful by default, generative opt-in (the anti-hallucination architecture)
+## Fidelity: reducing property hallucination on the generative path
 
-Real-estate video has a hard requirement the generative model can't meet on its own:
-**never invent or alter the property** (inventing furniture/rooms/features is a legal
-liability). Root cause found live: an image-to-video model synthesizes new pixels for
-any area a camera move reveals; a *translational* move (dolly-in/orbit/crane) toward a
-prompt-named target ("dolly-in toward the dining room") makes it fabricate that target —
-it invented a dining table in the dolly path even though the real one sat off through a
-doorway. Prompt design amplified it (declarative scene descriptions + directional moves).
+Real-estate video must **not invent or alter the property** (inventing furniture/rooms/
+features is a legal liability). Root cause found live: an image-to-video model
+synthesizes new pixels for any area a camera move reveals; a *translational* move
+(dolly-in/orbit/crane) toward a prompt-named target ("dolly-in toward the dining room")
+makes it fabricate that target — it invented a dining table in the dolly path even
+though the real one sat off through a doorway. Prompt design amplified it (declarative
+scene descriptions + directional moves).
 
-The system now makes fidelity **structural**, not a prompt we hope holds. Two modes,
-`Project.mode` (`@rev/core` `VideoMode`), default **`faithful`**:
+A deterministic "Ken Burns" (pan/zoom over the real photo) engine was trialed as a
+guaranteed-faithful default but **removed — the output quality was unacceptable**. The
+generative Higgsfield path is the product; we harden it toward fidelity instead:
 
-- **`faithful` (default) — `KenBurnsVideoGenEngine` (`videogen:ken-burns`)**: a real
-  pan/zoom over the ACTUAL photo via FFmpeg `zoompan` (super-sampled 2× for smoothness,
-  cover-crop to output AR, then zoom/pan within real pixels). Every output pixel is
-  sampled from the source, so **no object/room/feature can ever be invented — the
-  guarantee is by construction**. No API, no credits, seconds per clip. `motionPreset`
-  maps to a safe move (`kenBurnsMove`): translational i2v presets (dolly/orbit/crane)
-  degrade to an honest zoom/tilt. This is what real-photo runs use unless cinematic is
-  explicitly requested.
-- **`cinematic` (opt-in) — `HiggsfieldVideoGenEngine`**: generative i2v, only when the
-  Higgsfield key is set (else falls back to faithful). Even here we minimize drift
-  (defense in depth, since the DoP endpoint has no negative-prompt field): the Prompt
-  engine is **fidelity-first** — it emits NO declarative scene description (the image is
-  the sole authority on contents), only a neutral non-directional camera move
-  (`safeMovePhrase`, no "toward X") + lighting + a hard `FIDELITY_CONSTRAINT` ("do not
-  add, remove, move, or invent … keep every existing object unchanged").
+- **Fidelity-first Prompt engine** (`packages/engine-prompt`): emits NO declarative scene
+  description (the image is the sole authority on contents — this is what stops the model
+  inventing named furniture/rooms), only a neutral **non-directional** camera move
+  (`safeMovePhrase`, never "toward X" — a named destination is what the model synthesizes
+  toward) + lighting + a hard `FIDELITY_CONSTRAINT` on every prompt ("do not add, remove,
+  move, or invent any furniture, objects, rooms … keep every existing object unchanged").
+  Vision's photo-specific move still selects the motion *preset*, but its free-text
+  (which may name a destination) never reaches the prompt.
+- **`enhance_prompt: false`** in the Higgsfield submit body — disables the platform's
+  prompt "enhancer" (it embellishes and invents detail). Verified the DoP endpoint
+  accepts the field (a bad-image 422 flagged only `image_url`, not `enhance_prompt`).
 
-Selection lives in the server (`resolveVideogen`): faithful→Ken Burns, cinematic→
-Higgsfield-if-keyed. `POST /api/runs` takes `mode` (multipart field or JSON); the UI has
-a "cinematic AI motion" opt-in (default off) with a fidelity warning; `/api/health`
-reports `videogen:'ken-burns'` + `cinematicAvailable`. Verified: the exact living-room
-shot that fabricated a table now renders a faithful push-in — real dining table in its
-real place, nothing invented (7/7 clips, 30s, 0 credits, ~48s). `scripts/generate-real.ts
-<dir> <sec> [faithful|cinematic]` runs either mode.
-
-**Remaining limitation (inherent):** only the faithful path is a hard guarantee. The
-cinematic path reduces but cannot eliminate drift — prompts/constraints are soft, and
-the DoP endpoint lacks a negative prompt and (on the REST model-path we use) an
-`enhance_prompt:false`/`strength` control. A future automated frame-validation stage
-(sample clip frames, ask Claude "anything not in the source?", fall back to Ken Burns)
-is the designed next layer, deferred because the default is already a hard guarantee;
-the seam is a swappable post-videogen stage.
+**This reduces but cannot eliminate drift** — a generative model always has latitude, and
+the DoP REST endpoint has no negative-prompt field. Further levers, not yet applied:
+migrate to the SDK v2 endpoint (`/v1/image2video/dop`) for a low motion `strength`
+(less camera travel = less synthesis) and to guarantee `enhance_prompt` is honored; and
+an automated frame-validation stage (sample clip frames, ask Claude "anything not in the
+source?", regenerate/skip on drift). Both are documented Phase-9 options.
 
 ## External dependencies / keys
 
@@ -234,18 +221,35 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
 - [x] **Phase 1b — real Upload Engine** — `LocalUploadEngine` (sharp: EXIF rotate, normalize to JPEG, true dims, thumbnails), `@fastify/multipart` streaming on the server, UI sends real File bytes as FormData. Demo mode (no files) still uses the mock engine — first real use of the engine-swap mechanism. Verified: curl multipart (12 JPEGs incl. an EXIF-orientation-6 case → correctly 1000x1600) and full browser upload via Playwright. `scripts/make-test-photos.ts` regenerates test fixtures into `test-photos/` (gitignored).
 - [x] **Phase 2 — Vision Engine (Claude)** — `ClaudeVisionEngine` (opus-4-8, structured outputs, downscale, concurrency 4, per-image fallback) + `npm run analyze` debug CLI + server auto-swap when key present. Verified on real property photos: kitchen/living_room/outdoor correctly classified q≈0.9 with vivid descriptions that flow into prompts; solid-color junk correctly scored `other` q=0.05; full server E2E run mixed-quality photos correctly. `ANTHROPIC_API_KEY` now set in `.env`.
 - [x] **Phase 3 — Storyboard Engine (final)** — quality floor (drops junk, warns, errors if nothing usable), coverage-first selection with per-room cap 2 + overflow, exact-duration pacing via cumulative rounding (45s target now renders 45.00s, not 43.25s). 8 unit tests (`npm test`, node:test via tsx — first tests in the repo). `npm run storyboard <projectId>` preview tool. Verified against the real-photo project proj_5e627dec: 4 good photos → clean 17.75s tour + "shorter than requested" warning instead of a junk-padded 43s one.
-- [x] **Phase 4 — Prompt Engine (final)** — prompt shape: `"<Scene>. Camera: <move>. <Lighting> light; <room mood>. <style suffix>"`. Vision's photo-specific `suggestedMove` is used (mapped to a Higgsfield preset via `presetFromMove` keyword table in `templates.ts`); per-room variants provide fallback/rotation; identical back-to-back moves on the same room are auto-varied; leading-article bug ("the a blank frame") fixed via `withArticle`. `STYLE_SUFFIX` on every prompt bans people/text artifacts for stable i2v. 6 unit tests. Verified on real-photo project: photo-specific moves preserved, second consecutive outdoor crane auto-switched to lateral glide.
+- [x] **Phase 4 — Prompt Engine** — **NOTE: prompt shape superseded by the fidelity-first
+  rewrite (see the "Fidelity" section above).** Originally `"<Scene>. Camera: <move>.
+  <Lighting> light; <mood>. <style suffix>"` with Vision's description + directional move
+  in the prompt — that scene description + "toward X" move is exactly what caused the
+  dining-table hallucination. Now: no scene description, neutral `safeMovePhrase`, and a
+  hard `FIDELITY_CONSTRAINT`. Vision's `suggestedMove` still selects the motion preset
+  (`presetFromMove`); per-room variants fall back/rotate; identical back-to-back moves
+  auto-vary. Tests rewritten to assert the anti-hallucination guarantees.
 - [x] **Phase 5 — VideoGen Engine (Higgsfield)** — Prototyped via MCP: kitchen photo + Phase 4 prompt → real 5s clip (`projects/prototype/kitchen-dolly-in.mp4`, model `cinematic_studio_video_v2`, 5 credits, sound off; balance was 191 credits, kling3_0=7.5cr, seedance=17.5cr). Production `HiggsfieldVideoGenEngine` (`videogen:higgsfield`) targets the platform REST API (docs.higgsfield.ai): `POST /{model}` `{image_url(data URI), prompt, duration}` w/ `Authorization: Key key:secret` → poll `GET /requests/{id}/status` (queued|in_progress|completed|failed|nsfw) → download `video.url` to `workDir/clips/`. Concurrency 3, 2 attempts/shot, per-shot failure isolation (all-fail → error). Default model `higgsfield-ai/dop/standard` (override via `HIGGSFIELD_MODEL`). 5 unit tests w/ injected fetch. Server swaps it in when `HIGGSFIELD_API_KEY` (format `key:secret`) is in `.env`. VideoGen input widened to `{shots, assets}` (engine needs source images). **REST path now verified live (2026-07)** — see the Higgsfield-integration note below; the original data-URI image assumption was wrong and has been fixed to a CDN upload.
 
 ### Higgsfield integration — verified & gotchas (2026-07)
 - **Auth** `Authorization: Key <keyId>:<secret>` — the dashboard (cloud.higgsfield.ai/api-keys) issues a Key ID + Secret; join with a colon in `HIGGSFIELD_API_KEY`. Confirmed working (a bad image got 422 on the body, not 401).
 - **Image input is NOT a data URI.** The platform rejects data-URI `image_url` with **HTTP 422 `url_too_long`** (2083-char cap). Real flow (from the official SDK, `npm pack higgsfield-client`): `POST /files/generate-upload-url {content_type}` → `{upload_url, public_url}`, then `PUT` raw bytes to `upload_url` (presigned; only `Content-Type` header), then submit `public_url` as `image_url`. Implemented as `uploadImage()` in `higgsfield.ts`.
-- **Latency:** `dop/standard` ≈ generally a few min/clip but occasionally ~16 min under load. The engine's default `maxPollMs` (6 min) is therefore too low for the worst case — **known issue**: a poll timeout currently triggers a *resubmit* (maxAttempts 2), which double-bills. Until retry semantics are split (retry pre-submit/network errors, but never resubmit after a job exists), pass `maxAttempts: 1` for real runs (as `scripts/generate-real.ts` does).
+- **Latency & retry (fixed):** `dop/standard` ≈ a few min/clip, occasionally ~16 min under load. Default `maxPollMs` is 20 min. `generateShot` splits retry into two phases: obtaining a request_id (upload + submit) is retried (a failure there predates any billable job — e.g. a transient CDN 502), but poll + download is **never** retried, so a slow clip is never resubmitted/double-billed. So the default `maxAttempts: 2` is credit-safe.
+- **Fidelity (`enhance_prompt: false`):** the submit body disables the platform prompt-enhancer to curb invented detail (see the "Fidelity" section). Verified accepted by the DoP endpoint.
 - **Cost/timing seen:** 7-photo → 6/7 clips (one transient 502 on the upload-url step, isolated & skipped — pre-submit, so no credit), stitched to 25.83s 1080p in **13.2 min wall**. `scripts/smoke-higgsfield.ts` = one-clip live smoke test to run before any full run. First real tour: `projects/proj_99799c3f/output/tour.mp4`.
 - [x] **Phase 6 — Render Engine (FFmpeg)** — `FfmpegRenderEngine` (`render:ffmpeg`): per-clip normalize (scale+pad to config.resolution, fps=30, settb) + trim to shot.durationSec, chained `xfade` transitions (offset_k = Σdur − k·xfade), H.264 CRF19 `+faststart`, progress parsed from stderr `time=`. `buildXfadeGraph` + `probeDurationSec` exported (used by tests/scripts). Spawns `ffmpeg-static` directly — NOT fluent-ffmpeg (unmaintained; direct filter_complex control). Mock videogen now emits REAL color MP4s via ffmpeg, and `defaultEngines()` uses the real render — keyless `npm run demo` produces a playable 45.03s MP4. `npm run render <clipsDir> [out]` stitches any folder of clips. 5 render tests (2 run real ffmpeg + probe duration). **First real tour shipped: `projects/real-tour/tour.mp4`** (17.93s, 1080p, 4 real Higgsfield clips of the user's photos, crossfaded). Discovered live: starter plan = max 2 concurrent Higgsfield jobs → engine default concurrency now 2. Credits: 171 left (spent 20 total on 4 clips @ 5cr). Music + branding overlays deferred to Phase 7/8 (no licensed music assets yet).
 - [x] **Phase 7 — wiring, resume, preview + download** — `stage` became a resume checkpoint (`lastError` replaces the 'error' stage); `resumePipeline`/`nextStage` in orchestrator skip finished stages and, within videogen, keep shots whose clips exist on disk (never re-pay Higgsfield); videogen total-failure on resume downgrades to per-shot 'failed' when kept clips exist. New routes: `POST /api/projects/:id/resume`, `GET /api/projects/:id/video` (Range + `?download`); health reports key-gated engine wiring. UI: in-app `<video>` preview + Download MP4 button (ResultCard), "Resume from last checkpoint" button on error, engine line in header, EventSource connection-loss surfaced. 9 new tests (orchestrator resume + server routes, `buildApp({ projectsDir })` for test injection). Verified live: browser demo run → playing/seeking 1080p video; tampered project (3 of 7 clips deleted, stage='generating') resumed via API — "Resuming: 4/7 clips already generated", kept clips' mtimes untouched. Project verify recipe saved to `.claude/skills/verify/SKILL.md`.
 - [x] **Phase 8 — storyboard review screen** — a run started with `review: true` stops at the 'prompted' checkpoint (SSE `review` event, run status 'review') **before any clip spend**; the UI shows the planned tour (thumbnails or room-color swatches for demo, motion preset chips, vision descriptions, benched photos) with reorder/remove/restore; "Animate" = `PATCH /api/projects/:id/storyboard` (re-paces via the newly exported `paceDurations`) + the existing resume endpoint — approval is just Phase 7's resume from 'prompted'. "Review first" checkbox in the UI, default ON. 4 new tests (37 total). Verified live over HTTP: 30s demo review run → reversed + dropped a shot → 26.25s plan → resumed → rendered MP4 probed at 26.27s in the user's custom order.
-- [ ] **Phase 9** — (a) **VideoGen retry-semantics fix** (surfaced by the first real run): split the retry loop so pre-submit/network errors (upload-url, submit) retry but a poll timeout never resubmits (avoids double-billing on slow clips) — this also lets real runs use retries safely instead of `maxAttempts: 1`, which would have saved the 1 shot lost to a transient 502. Bump the default `maxPollMs`. (b) `upscale_video` (cloud.higgsfield.ai key now funded — unblocked). (c) beat-aware pacing + music (still no licensed music assets). (d) Tauri desktop packaging (needs the Rust toolchain).
+- [x] **Fidelity pass (2026-07)** — diagnosed/fixed the property-hallucination bug (model
+  fabricated a dining table). Prompt engine rewritten fidelity-first (no scene description,
+  neutral non-directional moves, hard `FIDELITY_CONSTRAINT`) and `enhance_prompt: false` on
+  the Higgsfield submit. A guaranteed-faithful Ken Burns engine was trialed as default but
+  **removed — quality was unacceptable**; Higgsfield (hardened) stays the product path.
+- [ ] **Phase 9** — (a) further fidelity levers for the generative path: migrate to the SDK
+  v2 endpoint (`/v1/image2video/dop`) to set a low motion `strength` and guarantee
+  `enhance_prompt` is honored; optional automated frame-validation (Claude checks each clip
+  vs its source, regenerate/skip on drift). (b) `upscale_video` (key funded — unblocked).
+  (c) beat-aware pacing + music (no licensed assets yet). (d) Tauri desktop packaging.
 
 ## Key decisions (locked for MVP)
 

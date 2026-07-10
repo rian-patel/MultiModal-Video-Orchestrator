@@ -34,17 +34,6 @@ export type ProjectStage =
 
 export type ShotStatus = 'pending' | 'generating' | 'done' | 'failed';
 
-/**
- * Fidelity posture for clip generation.
- * - 'faithful' (default): deterministic Ken Burns pan/zoom over the REAL photo
- *   via FFmpeg — every output pixel comes from the source, so no object,
- *   room, or feature can ever be invented. The legal-safe guarantee.
- * - 'cinematic': generative image-to-video (Higgsfield). More "alive" motion,
- *   but the model synthesizes new pixels for any revealed area and can drift
- *   from the property. Opt-in only; use for non-sensitive marketing.
- */
-export type VideoMode = 'faithful' | 'cinematic';
-
 /** Produced by the Upload Engine. */
 export interface Asset {
   id: string;
@@ -85,8 +74,6 @@ export interface Project {
   id: string;
   createdAt: string;
   targetDurationSec: 30 | 45 | 60;
-  /** Fidelity posture for this run. Defaults to 'faithful'. */
-  mode: VideoMode;
   stage: ProjectStage;
   assets: Asset[];
   vision: VisionResult[];

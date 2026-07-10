@@ -160,8 +160,12 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
       },
       body: JSON.stringify({
         image_url: imageUrl,
-        prompt: shot.prompt ?? 'Slow cinematic dolly-in. Photoreal, no people.',
+        prompt: shot.prompt ?? 'A slow, subtle push-in with minimal travel. Photoreal, no people.',
         duration: Math.max(1, Math.ceil(ctx.config.clipDurationSec)),
+        // Disable the platform's prompt "enhancer" — it embellishes the prompt
+        // and is a source of invented detail. Verified accepted by the DoP
+        // endpoint (fidelity over creativity for real-estate accuracy).
+        enhance_prompt: false,
       }),
     });
     if (!res.ok) {
