@@ -5,15 +5,17 @@ import { basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { FastifyInstance } from 'fastify';
 import { defaultConfig, newId } from '@rev/core';
-import type { Project } from '@rev/core';
+import type { Project, ReviewEventData, ReviewShot, Shot } from '@rev/core';
 import {
   loadProject,
   nextStage,
   resumePipeline,
   runPipeline,
+  saveProject,
   type PipelineEngines,
   type RunResult,
 } from '@rev/orchestrator';
+import { paceDurations } from '@rev/engine-storyboard';
 import {
   LocalUploadEngine,
   MAX_PHOTOS,
@@ -30,6 +32,8 @@ interface StartRunJsonBody {
   targetDurationSec?: number;
   /** Demo mode: names only, runs through the mock Upload Engine. */
   sourceNames?: string[];
+  /** Pause at the storyboard review checkpoint instead of animating straight through. */
+  review?: boolean;
 }
 
 const DEMO_SOURCES = Array.from({ length: 14 }, (_, i) => `DEMO_${String(i + 1).padStart(2, '0')}.jpg`);
@@ -37,6 +41,7 @@ const DEMO_SOURCES = Array.from({ length: 14 }, (_, i) => `DEMO_${String(i + 1).
 /** Custom SSE event names. 'error' is reserved by EventSource itself. */
 const SSE_NAME: Record<RunEvent['type'], string> = {
   progress: 'progress',
+  review: 'review',
   complete: 'complete',
   error: 'run-error',
 };
@@ -112,6 +117,7 @@ export function registerRunRoutes(
       const cleanup = () => rm(uploadDir, { recursive: true, force: true }).catch(() => {});
 
       let target: TourLength | null = null;
+      let review = false;
       const sources: SourceFile[] = [];
       try {
         for await (const part of req.parts()) {
@@ -127,6 +133,8 @@ export function registerRunRoutes(
             sources.push({ originalName, tmpPath });
           } else if (part.fieldname === 'targetDurationSec') {
             target = parseTarget(part.value);
+          } else if (part.fieldname === 'review') {
+            review = ['1', 'true', 'on'].includes(String(part.value).toLowerCase());
           }
         }
       } catch (err) {
@@ -156,6 +164,7 @@ export function registerRunRoutes(
             targetDurationSec: target,
             engines: { upload: new LocalUploadEngine(), ...keyedEngines() },
             config,
+            stopAfter: review ? 'prompted' : undefined,
             onProject: (projectId) => { run.projectId = projectId; },
             onProgress: (pct, stage, msg) =>
               registry.emit(run.id, { type: 'progress', data: { pct, stage, msg } }),
@@ -182,6 +191,7 @@ export function registerRunRoutes(
         request,
         targetDurationSec: target,
         config,
+        stopAfter: body.review ? 'prompted' : undefined,
         onProject: (projectId) => { run.projectId = projectId; },
         onProgress: (pct, stage, msg) =>
           registry.emit(run.id, { type: 'progress', data: { pct, stage, msg } }),
@@ -262,6 +272,77 @@ export function registerRunRoutes(
     return reply.code(202).send({ runId: run.id, projectId: id, resumeFrom: from });
   });
 
+  // The storyboard as the review screen shows it (shots + benched photos).
+  app.get('/api/projects/:id/storyboard', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const project = await readProject(projectsDir, id);
+    if (!project) return reply.code(404).send({ error: 'project not found' });
+    if (project.shots.length === 0) {
+      return reply.code(409).send({ error: 'no storyboard yet — the run has not reached that stage' });
+    }
+    return buildReviewData(project);
+  });
+
+  // Apply review edits: `assetIds` is the new tour (a subset of the current
+  // shots, in order). Durations are re-paced to the target. Only valid while
+  // the project is paused at the 'prompted' checkpoint.
+  app.patch('/api/projects/:id/storyboard', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const project = await readProject(projectsDir, id);
+    if (!project) return reply.code(404).send({ error: 'project not found' });
+    if (project.stage !== 'prompted') {
+      return reply.code(409).send({
+        error: `storyboard can only be edited while awaiting review (stage is "${project.stage}")`,
+      });
+    }
+    const { assetIds } = (req.body ?? {}) as { assetIds?: unknown };
+    if (
+      !Array.isArray(assetIds) ||
+      assetIds.length === 0 ||
+      !assetIds.every((x): x is string => typeof x === 'string')
+    ) {
+      return reply.code(400).send({ error: 'assetIds must be a non-empty array of shot asset ids' });
+    }
+    if (new Set(assetIds).size !== assetIds.length) {
+      return reply.code(400).send({ error: 'assetIds contains duplicates' });
+    }
+    const byAsset = new Map(project.shots.map((s) => [s.assetId, s]));
+    const unknown = assetIds.filter((a) => !byAsset.has(a));
+    if (unknown.length > 0) {
+      return reply.code(400).send({ error: `unknown shot asset ids: ${unknown.join(', ')}` });
+    }
+
+    const durations = paceDurations(
+      assetIds.length,
+      project.targetDurationSec,
+      defaultConfig.clipDurationSec,
+      defaultConfig.crossfadeSec,
+    );
+    project.shots = assetIds.map((assetId, i) => ({
+      ...(byAsset.get(assetId) as Shot),
+      order: i,
+      durationSec: durations[i],
+    }));
+    await saveProject(join(projectsDir, id), project);
+    return buildReviewData(project);
+  });
+
+  // Photo thumbnail for the review screen (real Upload Engine writes these).
+  app.get('/api/projects/:id/thumb/:assetId', async (req, reply) => {
+    const { id, assetId } = req.params as { id: string; assetId: string };
+    const project = await readProject(projectsDir, id);
+    if (!project) return reply.code(404).send({ error: 'project not found' });
+    const asset = project.assets.find((a) => a.id === assetId);
+    if (!asset?.thumbPath) return reply.code(404).send({ error: 'no thumbnail for this asset' });
+    const info = await stat(asset.thumbPath).catch(() => null);
+    if (!info) return reply.code(404).send({ error: 'thumbnail file is missing on disk' });
+    reply
+      .type('image/jpeg')
+      .header('cache-control', 'private, max-age=3600')
+      .header('content-length', info.size);
+    return reply.send(createReadStream(asset.thumbPath));
+  });
+
   // Stream the finished MP4. Supports Range requests (required for <video>
   // seeking); `?download` adds a content-disposition attachment.
   app.get('/api/projects/:id/video', async (req, reply) => {
@@ -300,6 +381,57 @@ export function registerRunRoutes(
   });
 }
 
+/**
+ * Storyboard as the review screen sees it: tour shots in order plus benched
+ * photos (analyzed but not selected), with thumbnail URLs where they exist.
+ */
+function buildReviewData(project: Project): ReviewEventData {
+  const visionById = new Map(project.vision.map((v) => [v.assetId, v]));
+  const assetById = new Map(project.assets.map((a) => [a.id, a]));
+  const toReview = (shot: Shot): ReviewShot => {
+    const v = visionById.get(shot.assetId);
+    return {
+      assetId: shot.assetId,
+      order: shot.order,
+      roomType: shot.roomType,
+      durationSec: shot.durationSec,
+      prompt: shot.prompt,
+      motionPreset: shot.motionPreset,
+      description: v?.description,
+      qualityScore: v?.qualityScore,
+      thumbUrl: assetById.get(shot.assetId)?.thumbPath
+        ? `/api/projects/${project.id}/thumb/${shot.assetId}`
+        : undefined,
+    };
+  };
+
+  const shots = [...project.shots].sort((a, b) => a.order - b.order).map(toReview);
+  const inTour = new Set(project.shots.map((s) => s.assetId));
+  const bench = project.vision
+    .filter((v) => !inTour.has(v.assetId))
+    .sort((a, b) => b.qualityScore - a.qualityScore)
+    .map((v, i) =>
+      toReview({ order: i, assetId: v.assetId, roomType: v.roomType, durationSec: 0, status: 'pending' }),
+    );
+
+  const sum = project.shots.reduce((a, s) => a + s.durationSec, 0);
+  const totalDurationSec =
+    project.shots.length === 0
+      ? 0
+      : Math.round((sum - (project.shots.length - 1) * defaultConfig.crossfadeSec) * 100) / 100;
+
+  return {
+    projectId: project.id,
+    stage: project.stage,
+    targetDurationSec: project.targetDurationSec,
+    totalDurationSec,
+    clipDurationSec: defaultConfig.clipDurationSec,
+    crossfadeSec: defaultConfig.crossfadeSec,
+    shots,
+    bench,
+  };
+}
+
 /** Runs one pipeline promise, mapping its lifecycle onto run events. */
 async function trackRun(
   registry: RunRegistry,
@@ -310,6 +442,11 @@ async function trackRun(
   try {
     const { project, render } = await work();
     run.projectId = project.id;
+    // No render result = the run paused at the review checkpoint.
+    if (!render) {
+      registry.emit(run.id, { type: 'review', data: buildReviewData(project) });
+      return;
+    }
     const done = project.shots.filter((s) => s.status === 'done');
     registry.emit(run.id, {
       type: 'complete',

@@ -1,19 +1,27 @@
 import { useEffect, useState } from 'react';
-import type { CompleteEventData, HealthData, ProgressEventData } from '@rev/core';
-import { checkHealth, resumeRun, startRun, watchRun } from './api';
+import type {
+  CompleteEventData,
+  HealthData,
+  ProgressEventData,
+  ReviewEventData,
+} from '@rev/core';
+import { checkHealth, patchStoryboard, resumeRun, startRun, watchRun } from './api';
 import { Dropzone } from './components/Dropzone';
 import { LengthSelector, type TourLength } from './components/LengthSelector';
 import { ProgressBar } from './components/ProgressBar';
 import { ResultCard } from './components/ResultCard';
+import { ReviewScreen } from './components/ReviewScreen';
 
-type Phase = 'idle' | 'running' | 'complete' | 'error';
+type Phase = 'idle' | 'running' | 'review' | 'complete' | 'error';
 
 export default function App() {
   const [health, setHealth] = useState<HealthData | null | undefined>(undefined);
   const [files, setFiles] = useState<File[]>([]);
   const [length, setLength] = useState<TourLength>(45);
+  const [reviewFirst, setReviewFirst] = useState(true);
   const [phase, setPhase] = useState<Phase>('idle');
   const [progress, setProgress] = useState<ProgressEventData | null>(null);
+  const [review, setReview] = useState<ReviewEventData | null>(null);
   const [result, setResult] = useState<CompleteEventData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
@@ -29,6 +37,11 @@ export default function App() {
   function follow(runId: string) {
     watchRun(runId, {
       onProgress: setProgress,
+      onReview: (d) => {
+        setReview(d);
+        setProjectId(d.projectId);
+        setPhase('review');
+      },
       onComplete: (d) => {
         setResult(d);
         setProjectId(d.projectId);
@@ -45,11 +58,27 @@ export default function App() {
   async function handleGenerate() {
     setPhase('running');
     setProgress(null);
+    setReview(null);
     setResult(null);
     setError(null);
     setProjectId(null);
     try {
-      follow(await startRun(length, usingDemo ? undefined : files));
+      follow(await startRun(length, usingDemo ? undefined : files, reviewFirst));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setPhase('error');
+    }
+  }
+
+  // Approve the (possibly edited) storyboard: persist the edits, then
+  // continue the pipeline from the 'prompted' checkpoint via resume.
+  async function handleAnimate(assetIds: string[]) {
+    if (!projectId) return;
+    setPhase('running');
+    setProgress(null);
+    try {
+      await patchStoryboard(projectId, assetIds);
+      follow(await resumeRun(projectId));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('error');
@@ -107,6 +136,18 @@ export default function App() {
           <Dropzone files={files} onChange={setFiles} disabled={busy} />
           <LengthSelector value={length} onChange={setLength} disabled={busy} />
 
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={reviewFirst}
+              onChange={(e) => setReviewFirst(e.target.checked)}
+              disabled={busy}
+              className="size-4 accent-sky-500"
+            />
+            Review the storyboard before animating
+            <span className="text-xs text-slate-500">(no clips are paid for until you approve)</span>
+          </label>
+
           <button
             type="button"
             onClick={handleGenerate}
@@ -117,6 +158,15 @@ export default function App() {
           </button>
 
           {phase === 'running' && <ProgressBar progress={progress} />}
+
+          {phase === 'review' && review && (
+            <ReviewScreen
+              key={review.projectId}
+              review={review}
+              onAnimate={handleAnimate}
+              onDiscard={() => setPhase('idle')}
+            />
+          )}
 
           {phase === 'complete' && result && <ResultCard result={result} />}
 

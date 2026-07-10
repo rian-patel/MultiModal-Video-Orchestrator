@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { defaultConfig } from '@rev/core';
 import type { Asset, EngineContext, RoomType, VisionResult } from '@rev/core';
-import { ROOM_PRIORITY, RuleBasedStoryboardEngine } from './index';
+import { paceDurations, ROOM_PRIORITY, RuleBasedStoryboardEngine } from './index';
 
 // --- helpers -----------------------------------------------------------
 
@@ -151,4 +151,20 @@ test('selection is deterministic', async () => {
   const a = await engine.process(input(photos, 45), makeCtx());
   const b = await engine.process(input(photos, 45), makeCtx());
   assert.deepEqual(a, b);
+});
+
+test('paceDurations: exact fit at the ideal clip count, full-length otherwise', () => {
+  const cutLen = (d: number[], xfade: number) =>
+    Math.round((d.reduce((a, b) => a + b, 0) - (d.length - 1) * xfade) * 100) / 100;
+
+  // 30/45/60s at clip 5s, xfade 0.75s -> 7/11/14 clips, each cut sums exactly
+  for (const [target, n] of [[30, 7], [45, 11], [60, 14]] as const) {
+    const d = paceDurations(n, target, 5, 0.75);
+    assert.equal(d.length, n);
+    assert.equal(cutLen(d, 0.75), target, `${target}s cut must be exact`);
+    assert.ok(d.every((x) => x <= 5 + 1e-9), 'no clip may exceed the clip max');
+  }
+
+  // fewer clips than ideal (review removals / too few photos) -> full length
+  assert.deepEqual(paceDurations(4, 45, 5, 0.75), [5, 5, 5, 5]);
 });

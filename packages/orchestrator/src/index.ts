@@ -61,6 +61,9 @@ export interface RunOptions {
   /** Fires as soon as the project exists on disk — lets callers attach the
    * projectId to failure reports so the run can be resumed. */
   onProject?: (projectId: string) => void;
+  /** Stop at the 'prompted' checkpoint (before any paid clip generation) so
+   * the user can review/edit the storyboard; continue via resumePipeline. */
+  stopAfter?: 'prompted';
 }
 
 export interface ResumeOptions {
@@ -72,7 +75,8 @@ export interface ResumeOptions {
 
 export interface RunResult {
   project: Project;
-  render: RenderResult;
+  /** Absent when the run stopped at a review checkpoint (`stopAfter`). */
+  render?: RenderResult;
 }
 
 const STAGES = ['upload', 'vision', 'storyboard', 'prompt', 'videogen', 'render'] as const;
@@ -150,7 +154,7 @@ async function executeFrom(
   workDir: string,
   from: PipelineStage,
   config: PipelineConfig,
-  opts: Pick<RunOptions, 'engines' | 'onProgress'>,
+  opts: Pick<RunOptions, 'engines' | 'onProgress' | 'stopAfter'>,
   request?: UploadRequest,
 ): Promise<RunResult> {
   const engines = { ...defaultEngines(), ...opts.engines };
@@ -207,6 +211,14 @@ async function executeFrom(
       );
       project.stage = 'prompted';
       await saveProject(workDir, project);
+    }
+
+    // Review pause: hand the storyboard back to the user before spending on
+    // clip generation. 'prompted' is a normal checkpoint, so continuing is
+    // just resumePipeline (which is also how edits get animated).
+    if (opts.stopAfter === 'prompted') {
+      logger.info(`Project ${project.id}: paused at '${project.stage}' for storyboard review`);
+      return { project };
     }
 
     // 5. Video generation — checkpoint *before* the expensive stage so a

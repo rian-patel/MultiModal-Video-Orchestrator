@@ -88,14 +88,17 @@ apps/
                       routes/health.ts, routes/runs.ts, paths.ts = repo-root resolution)
   web/               @rev/web — React 19 + Vite + Tailwind v4 (port 5173, /api proxied
                      to 3001): App.tsx, api.ts (SSE client), components/{Dropzone,
-                     LengthSelector, ProgressBar, ResultCard (video preview + download)}
+                     LengthSelector, ProgressBar, ResultCard (video preview + download),
+                     ReviewScreen (storyboard review: reorder/remove/approve)}
 scripts/demo.ts      runs the full pipeline on fake data (no server needed)
 projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (gitignored)
 ```
 
 ### Server API (stable shape)
 - `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
-- `POST /api/runs` — two content types:
+- `POST /api/runs` — two content types (both accept a **review** flag: multipart field
+  `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
+  SSE `review` instead of animating straight through — no clip spend until approval):
   - `multipart/form-data`: real photos. Fields: `targetDurationSec` (30|45|60) +
     `photos` file parts (10–40, ≤30 MB each). Streamed to `%TMP%/rev-uploads/<id>/`,
     run through the real `LocalUploadEngine` (engine override), temp dir removed
@@ -103,12 +106,20 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
   - `application/json` `{ targetDurationSec }`: demo mode — built-in 14-name set
     through the mock Upload Engine. → `202 { runId }`.
 - `GET  /api/runs/:id` → snapshot `{ id, status, projectId, lastEvent }` (projectId set as soon as the project exists, not only on success).
-- `GET  /api/runs/:id/events` → SSE. Event names: `progress`, `complete`, `run-error`
-  (NOT `error` — that's reserved by EventSource). Replays buffered events to late
-  subscribers, so reconnects recover the full history. `complete` carries `videoUrl`
-  + shot count/rooms of **successful** shots only; `run-error` carries `projectId?`
-  (what enables Resume in the UI). The web client also handles EventSource giving up
-  (server restarted mid-run → 404 → readyState CLOSED) with a "lost connection" error.
+- `GET  /api/runs/:id/events` → SSE. Event names: `progress`, `review`, `complete`,
+  `run-error` (NOT `error` — that's reserved by EventSource). Replays buffered events
+  to late subscribers, so reconnects recover the full history. `complete` carries
+  `videoUrl` + shot count/rooms of **successful** shots only; `review` carries
+  `ReviewEventData` (shots w/ prompts+thumbUrls, benched photos, pacing config) and is
+  terminal for that run's stream; `run-error` carries `projectId?` (what enables Resume
+  in the UI). The web client also handles EventSource giving up (server restarted
+  mid-run → 404 → readyState CLOSED) with a "lost connection" error.
+- `GET  /api/projects/:id/storyboard` → `ReviewEventData` for the saved project (409 before Storyboard has run).
+- `PATCH /api/projects/:id/storyboard` `{ assetIds: string[] }` — the new tour, in
+  order (omitting = removing); subset of current shots, no dups. Re-paces durations via
+  `paceDurations` (exported by engine-storyboard: exact target at the ideal clip count,
+  full-length clips otherwise) and saves. Only while stage is 'prompted' (409 otherwise).
+- `GET  /api/projects/:id/thumb/:assetId` → 320px JPEG thumbnail (404 for mock/demo assets).
 - `POST /api/projects/:id/resume` → `202 { runId, projectId, resumeFrom }` — re-runs a
   persisted project from its last checkpoint (semantics below). 404 unknown project,
   409 if already complete or upload never finished. Same SSE contract as a normal run.
@@ -181,7 +192,8 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
 - [x] **Phase 5 — VideoGen Engine (Higgsfield)** — Prototyped via MCP: kitchen photo + Phase 4 prompt → real 5s clip (`projects/prototype/kitchen-dolly-in.mp4`, model `cinematic_studio_video_v2`, 5 credits, sound off; balance was 191 credits, kling3_0=7.5cr, seedance=17.5cr). Production `HiggsfieldVideoGenEngine` (`videogen:higgsfield`) targets the platform REST API (docs.higgsfield.ai): `POST /{model}` `{image_url(data URI), prompt, duration}` w/ `Authorization: Key key:secret` → poll `GET /requests/{id}/status` (queued|in_progress|completed|failed|nsfw) → download `video.url` to `workDir/clips/`. Concurrency 3, 2 attempts/shot, per-shot failure isolation (all-fail → error). Default model `higgsfield-ai/dop/standard` (override via `HIGGSFIELD_MODEL`). 5 unit tests w/ injected fetch. Server swaps it in when `HIGGSFIELD_API_KEY` (format `key:secret`) is in `.env` — **REST path unverified until a platform key exists** (platform.higgsfield.ai account ≠ MCP subscription credits); data-URI image input is a fal-convention assumption to validate on first real run. VideoGen input widened to `{shots, assets}` (engine needs source images).
 - [x] **Phase 6 — Render Engine (FFmpeg)** — `FfmpegRenderEngine` (`render:ffmpeg`): per-clip normalize (scale+pad to config.resolution, fps=30, settb) + trim to shot.durationSec, chained `xfade` transitions (offset_k = Σdur − k·xfade), H.264 CRF19 `+faststart`, progress parsed from stderr `time=`. `buildXfadeGraph` + `probeDurationSec` exported (used by tests/scripts). Spawns `ffmpeg-static` directly — NOT fluent-ffmpeg (unmaintained; direct filter_complex control). Mock videogen now emits REAL color MP4s via ffmpeg, and `defaultEngines()` uses the real render — keyless `npm run demo` produces a playable 45.03s MP4. `npm run render <clipsDir> [out]` stitches any folder of clips. 5 render tests (2 run real ffmpeg + probe duration). **First real tour shipped: `projects/real-tour/tour.mp4`** (17.93s, 1080p, 4 real Higgsfield clips of the user's photos, crossfaded). Discovered live: starter plan = max 2 concurrent Higgsfield jobs → engine default concurrency now 2. Credits: 171 left (spent 20 total on 4 clips @ 5cr). Music + branding overlays deferred to Phase 7/8 (no licensed music assets yet).
 - [x] **Phase 7 — wiring, resume, preview + download** — `stage` became a resume checkpoint (`lastError` replaces the 'error' stage); `resumePipeline`/`nextStage` in orchestrator skip finished stages and, within videogen, keep shots whose clips exist on disk (never re-pay Higgsfield); videogen total-failure on resume downgrades to per-shot 'failed' when kept clips exist. New routes: `POST /api/projects/:id/resume`, `GET /api/projects/:id/video` (Range + `?download`); health reports key-gated engine wiring. UI: in-app `<video>` preview + Download MP4 button (ResultCard), "Resume from last checkpoint" button on error, engine line in header, EventSource connection-loss surfaced. 9 new tests (orchestrator resume + server routes, `buildApp({ projectsDir })` for test injection). Verified live: browser demo run → playing/seeking 1080p video; tampered project (3 of 7 clips deleted, stage='generating') resumed via API — "Resuming: 4/7 clips already generated", kept clips' mtimes untouched. Project verify recipe saved to `.claude/skills/verify/SKILL.md`.
-- [ ] **Phase 8** — Storyboard review screen, `upscale_video`, beat-aware pacing, Tauri desktop packaging.
+- [x] **Phase 8 — storyboard review screen** — a run started with `review: true` stops at the 'prompted' checkpoint (SSE `review` event, run status 'review') **before any clip spend**; the UI shows the planned tour (thumbnails or room-color swatches for demo, motion preset chips, vision descriptions, benched photos) with reorder/remove/restore; "Animate" = `PATCH /api/projects/:id/storyboard` (re-paces via the newly exported `paceDurations`) + the existing resume endpoint — approval is just Phase 7's resume from 'prompted'. "Review first" checkbox in the UI, default ON. 4 new tests (37 total). Verified live over HTTP: 30s demo review run → reversed + dropped a shot → 26.25s plan → resumed → rendered MP4 probed at 26.27s in the user's custom order.
+- [ ] **Phase 9** — remaining Phase-8 backlog, each currently blocked by an external prerequisite: `upscale_video` (needs a funded platform.higgsfield.ai key — `.env` key is present but empty), beat-aware pacing + music (no licensed music assets yet), Tauri desktop packaging (needs the Rust toolchain installed).
 
 ## Key decisions (locked for MVP)
 

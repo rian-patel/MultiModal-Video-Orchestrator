@@ -44,6 +44,11 @@ implementations the next run will use (key-gated: `claude`/`higgsfield` vs `mock
   some shots `failed` + delete their `clipPath` files) then
   `POST /api/projects/:id/resume` — progress should say
   "Resuming: N/M clips already generated" and kept clips' mtimes must not change.
+- Review flow: `POST /api/runs` with `{"targetDurationSec":30,"review":true}` →
+  run status becomes `review` (~1 s, no clips made). `GET /api/projects/:id/storyboard`,
+  `PATCH` it with a reordered/reduced `assetIds` list (totals re-pace: same count →
+  exact target; fewer → n*5 − (n−1)*0.75), then `POST .../resume` to animate.
+  Probe the output MP4 duration — it must match the PATCHed plan (±0.05 s).
 
 ## Gotchas
 

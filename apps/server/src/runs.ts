@@ -3,11 +3,13 @@ import type {
   CompleteEventData,
   ErrorEventData,
   ProgressEventData,
+  ReviewEventData,
   RunStatus,
 } from '@rev/core';
 
 export type RunEvent =
   | { type: 'progress'; data: ProgressEventData }
+  | { type: 'review'; data: ReviewEventData }
   | { type: 'complete'; data: CompleteEventData }
   | { type: 'error'; data: ErrorEventData };
 
@@ -50,6 +52,7 @@ export class RunRegistry {
     const run = this.runs.get(id);
     if (!run) return;
     run.events.push(event);
+    if (event.type === 'review') run.status = 'review';
     if (event.type === 'complete') run.status = 'complete';
     if (event.type === 'error') run.status = 'error';
     for (const fn of run.subscribers) fn(event);

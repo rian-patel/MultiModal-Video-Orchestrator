@@ -9,6 +9,38 @@ export interface StoryboardInput {
   targetDurationSec: number;
 }
 
+/**
+ * Per-clip durations for n clips covering targetDurationSec with crossfade
+ * overlaps. Exact fit (cumulative rounding, sums to the target) when n is the
+ * ideal clip count for the target; otherwise every clip runs full length and
+ * the video comes out shorter. Also used by the server to re-pace the tour
+ * after review-screen edits.
+ */
+export function paceDurations(
+  n: number,
+  targetDurationSec: number,
+  clipMaxSec: number,
+  xfadeSec: number,
+): number[] {
+  const denom = Math.max(0.1, clipMaxSec - xfadeSec);
+  const nIdeal = Math.max(1, Math.ceil((targetDurationSec - xfadeSec) / denom));
+  const durations = new Array<number>(n);
+  if (n === nIdeal) {
+    const d = (targetDurationSec + (nIdeal - 1) * xfadeSec) / nIdeal; // <= clipMax by construction
+    // Cumulative rounding: each clip is round(d) +/- 0.01 and the series
+    // sums to n*d exactly, so no clip ever exceeds clipMax.
+    let prevCum = 0;
+    for (let i = 0; i < n; i++) {
+      const cum = Math.round(d * (i + 1) * 100) / 100;
+      durations[i] = Math.round((cum - prevCum) * 100) / 100;
+      prevCum = cum;
+    }
+  } else {
+    durations.fill(clipMaxSec);
+  }
+  return durations;
+}
+
 interface Candidate {
   asset: Asset;
   vision: VisionResult;
@@ -95,20 +127,7 @@ export class RuleBasedStoryboardEngine implements Engine<StoryboardInput, Shot[]
 
     // 3. Pacing — exact fit when we have enough clips; otherwise every clip
     // runs full length and the video is shorter than requested.
-    const durations = new Array<number>(chosen.length);
-    if (chosen.length === nIdeal) {
-      const d = (targetDurationSec + (nIdeal - 1) * xfade) / nIdeal; // <= clipMax by construction
-      // Cumulative rounding: each clip is round(d) +/- 0.01 and the series
-      // sums to n*d exactly, so no clip ever exceeds clipMax.
-      let prevCum = 0;
-      for (let i = 0; i < nIdeal; i++) {
-        const cum = Math.round(d * (i + 1) * 100) / 100;
-        durations[i] = Math.round((cum - prevCum) * 100) / 100;
-        prevCum = cum;
-      }
-    } else {
-      durations.fill(clipMax);
-    }
+    const durations = paceDurations(chosen.length, targetDurationSec, clipMax, xfade);
 
     const shots: Shot[] = chosen.map((c, i) => ({
       order: i,

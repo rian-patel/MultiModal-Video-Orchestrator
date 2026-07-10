@@ -9,6 +9,7 @@
   "dependencies": {
     "@fastify/multipart": "^9.0.0",
     "@rev/core": "*",
+    "@rev/engine-storyboard": "*",
     "@rev/engine-upload": "*",
     "@rev/engine-vision": "*",
     "@rev/engine-videogen": "*",

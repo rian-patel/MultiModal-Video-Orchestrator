@@ -221,6 +221,33 @@ test("resume from 'rendering' never touches videogen", async () => {
   assert.equal(resumed.stage, 'complete');
 });
 
+test("stopAfter 'prompted' pauses for review; resume animates the edited board", async () => {
+  const config = await tempConfig();
+
+  // The review run must never touch videogen — a throwing stub proves it.
+  const { project, render } = await runPipeline({
+    request: REQUEST,
+    targetDurationSec: 30,
+    config,
+    stopAfter: 'prompted',
+    engines: { videogen: failingVideogen('videogen must not run before approval'), render: stubRender() },
+  });
+  assert.equal(render, undefined, 'review pause returns no render result');
+  assert.equal(project.stage, 'prompted');
+  assert.ok(project.shots.length > 0);
+  assert.ok(project.shots.every((s) => s.prompt), 'prompts are ready for review');
+  assert.equal(nextStage(project), 'videogen', 'continue point is clip generation');
+
+  // Approval = plain resume from the checkpoint.
+  const { project: done, render: finished } = await resumePipeline({
+    projectId: project.id,
+    config,
+    engines: { videogen: stubVideogen(), render: stubRender() },
+  });
+  assert.equal(done.stage, 'complete');
+  assert.ok(finished && existsSync(finished.outputPath));
+});
+
 test('unresumable states are rejected with a clear error', async () => {
   const config = await tempConfig();
 

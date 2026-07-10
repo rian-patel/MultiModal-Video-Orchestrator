@@ -12,6 +12,7 @@ const request: UploadRequest = {
 async function main() {
   console.log('\n=== Real Estate Video Generator — Phase 0 mock pipeline ===\n');
 
+  // No stopAfter -> render is always produced; the guard narrows the type.
   const { project, render } = await runPipeline({
     request,
     targetDurationSec: 45,
@@ -23,6 +24,7 @@ async function main() {
       if (pct === 100 && stage === 'render') process.stdout.write('\n');
     },
   });
+  if (!render) throw new Error('pipeline returned no render result');
 
   console.log('\n--- Storyboard --------------------------------------------');
   for (const s of project.shots) {
