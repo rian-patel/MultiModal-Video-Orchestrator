@@ -70,9 +70,12 @@ export interface ReviewEventData {
 export interface HealthData {
   ok: boolean;
   service: string;
-  /** Which implementation each key-gated engine will use for the next run. */
   engines: {
+    /** Photo analysis: real Claude when the key is set, else mock. */
     vision: 'claude' | 'mock';
-    videogen: 'higgsfield' | 'mock';
+    /** Default motion for real-photo runs — always the faithful Ken Burns engine. */
+    videogen: 'ken-burns';
+    /** Whether the opt-in generative ('cinematic') mode is available (Higgsfield key set). */
+    cinematicAvailable: boolean;
   };
 }

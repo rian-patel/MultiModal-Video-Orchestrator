@@ -43,10 +43,13 @@ async function toRunId(res: Response): Promise<string> {
  * storyboard checkpoint (before any paid clip generation) and emits a
  * `review` event instead of running through.
  */
+export type VideoMode = 'faithful' | 'cinematic';
+
 export async function startRun(
   targetDurationSec: number,
   files?: File[],
   review = false,
+  mode: VideoMode = 'faithful',
 ): Promise<string> {
   let res: Response;
   if (files && files.length > 0) {
@@ -54,13 +57,14 @@ export async function startRun(
     // Field order matters for streaming parsers: scalar fields first.
     form.append('targetDurationSec', String(targetDurationSec));
     if (review) form.append('review', '1');
+    form.append('mode', mode);
     for (const f of files) form.append('photos', f, f.name);
     res = await fetch('/api/runs', { method: 'POST', body: form });
   } else {
     res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ targetDurationSec, review }),
+      body: JSON.stringify({ targetDurationSec, review, mode }),
     });
   }
   return toRunId(res);

@@ -1,5 +1,5 @@
 import type { Engine, EngineContext, Shot, VisionResult } from '@rev/core';
-import { presetFromMove, ROOM_PROMPTS, STYLE_SUFFIX } from './templates';
+import { FIDELITY_CONSTRAINT, presetFromMove, ROOM_PROMPTS, safeMovePhrase } from './templates';
 
 export * from './templates';
 
@@ -10,22 +10,20 @@ export interface PromptInput {
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
-/** "spacious kitchen" -> "A spacious kitchen"; "a blank frame" -> "A blank frame". */
-function withArticle(desc: string): string {
-  const trimmed = desc.trim().replace(/\.+$/, '');
-  if (/^(a|an|the)\s/i.test(trimmed)) return cap(trimmed);
-  const article = /^[aeiou]/i.test(trimmed) ? 'An' : 'A';
-  return `${article} ${trimmed}`;
-}
-
 /**
- * Composes each shot's image-to-video prompt:
- *   "<Scene>. Camera: <move>. <Lighting> light; <mood>. <style suffix>"
+ * Composes each shot's image-to-video prompt, fidelity-first:
+ *   "Camera: <safe move>. <Lighting> light; <mood>. <fidelity constraint>"
  *
- * The camera move prefers Vision's photo-specific suggestion (mapped onto a
- * Higgsfield motion preset); room-type variants provide fallbacks, rotate
- * across repeat rooms, and break up identical back-to-back moves within the
- * same room. Swappable for an LLM prompt writer behind the same interface.
+ * Deliberately carries NO declarative description of the scene's contents — the
+ * source image is the sole authority on what's in the room, and naming
+ * furniture or adjacent rooms in the prompt is what leads a generative model to
+ * invent them (the dining-table hallucination). The prompt now supplies only
+ * the camera move (from a neutral, non-directional palette) and mood.
+ *
+ * Vision's photo-specific suggestion still selects the motion PRESET (which the
+ * faithful Ken Burns engine maps to a real pan/zoom, and which picks the safe
+ * phrasing here) — but Vision's free-text, which may name a destination like
+ * "toward the dining room", never reaches the prompt.
  */
 export class TemplatePromptEngine implements Engine<PromptInput, Shot[]> {
   readonly name = 'prompt:template';
@@ -44,39 +42,29 @@ export class TemplatePromptEngine implements Engine<PromptInput, Shot[]> {
       const occ = occurrence.get(shot.roomType) ?? 0;
       occurrence.set(shot.roomType, occ + 1);
 
-      // Camera move: Vision's photo-specific suggestion wins; otherwise
+      // Motion preset: Vision's photo-specific suggestion wins; otherwise
       // rotate through the room's variants for variety on repeats.
-      let move = v?.suggestedMove?.trim();
-      let preset: string;
-      if (move) {
-        preset = presetFromMove(move, shot.roomType);
-      } else {
-        const variant = spec.variants[occ % spec.variants.length];
-        move = variant.move;
-        preset = variant.motion;
-      }
+      let preset = v?.suggestedMove?.trim()
+        ? presetFromMove(v.suggestedMove.trim(), shot.roomType)
+        : spec.variants[occ % spec.variants.length].motion;
 
       // Editing rule: two identical moves in a row on the same room feels
       // repetitive — switch the later shot to a differing variant.
       if (preset === prevPreset && shot.roomType === prevRoom) {
-        const alts = spec.variants.filter((x) => x.motion !== preset);
-        if (alts.length > 0) {
-          const alt = alts[occ % alts.length];
-          move = alt.move;
-          preset = alt.motion;
-        }
+        const alt = spec.variants.filter((x) => x.motion !== preset)[occ % Math.max(1, spec.variants.length - 1)];
+        if (alt) preset = alt.motion;
       }
       prevPreset = preset;
       prevRoom = shot.roomType;
 
-      const scene = withArticle(v?.description ?? shot.roomType.replace(/_/g, ' '));
       const lighting = v?.lighting ?? 'natural';
-      const prompt = `${scene}. Camera: ${move}. ${cap(lighting)} light; ${spec.mood}. ${STYLE_SUFFIX}`;
+      // Content comes from the image, never the prompt.
+      const prompt = `Camera: ${safeMovePhrase(preset)}. ${cap(lighting)} light; ${spec.mood}. ${FIDELITY_CONSTRAINT}`;
 
       return { ...shot, prompt, motionPreset: preset };
     });
 
-    ctx.progress(100, `Wrote ${out.length} cinematic prompts`);
+    ctx.progress(100, `Wrote ${out.length} fidelity-first prompts`);
     return out;
   }
 }

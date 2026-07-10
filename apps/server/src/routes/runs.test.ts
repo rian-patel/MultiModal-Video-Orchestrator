@@ -16,6 +16,7 @@ async function makeCompletedProject(projectsDir: string, id: string, bytes: stri
     id,
     createdAt: new Date().toISOString(),
     targetDurationSec: 45,
+    mode: 'faithful',
     stage: 'complete',
     assets: [],
     vision: [],

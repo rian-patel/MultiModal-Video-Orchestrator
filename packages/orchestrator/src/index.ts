@@ -12,6 +12,7 @@ import type {
   PipelineConfig,
   Project,
   Shot,
+  VideoMode,
   VisionResult,
 } from '@rev/core';
 import { MockUploadEngine, type UploadRequest } from '@rev/engine-upload';
@@ -53,6 +54,8 @@ export function defaultEngines(): PipelineEngines {
 export interface RunOptions {
   request: UploadRequest;
   targetDurationSec: 30 | 45 | 60;
+  /** Recorded on the Project for the run's provenance. Defaults to 'faithful'. */
+  mode?: VideoMode;
   config?: PipelineConfig;
   /** Override any subset of engines to swap implementations. */
   engines?: Partial<PipelineEngines>;
@@ -113,6 +116,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
     id: newId('proj'),
     createdAt: new Date().toISOString(),
     targetDurationSec: opts.targetDurationSec,
+    mode: opts.mode ?? 'faithful',
     stage: 'created',
     assets: [],
     vision: [],

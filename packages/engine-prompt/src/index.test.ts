@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { defaultConfig } from '@rev/core';
 import type { EngineContext, RoomType, Shot, VisionResult } from '@rev/core';
 import { TemplatePromptEngine } from './index';
-import { presetFromMove, STYLE_SUFFIX } from './templates';
+import { FIDELITY_CONSTRAINT, presetFromMove, safeMovePhrase } from './templates';
 
 function makeCtx(): EngineContext {
   const noop = () => {};
@@ -46,25 +46,44 @@ function build(entries: { shot: Shot; vision?: VisionResult }[]) {
 
 const engine = new TemplatePromptEngine();
 
-test("vision's photo-specific move is used and mapped to a preset", async () => {
+// --- the anti-hallucination guarantee -----------------------------------
+
+test('prompt carries NO scene description and NO directional target', async () => {
+  // Exactly the shape that produced the dining-table hallucination.
+  const a = shotWithVision('living_room', {
+    description:
+      'bright open-concept living room with a sectional sofa flowing into an adjacent dining area',
+    suggestedMove: 'slow dolly-in through the seating area toward the dining room',
+  });
+  const [s] = await engine.process(build([a]), makeCtx());
+
+  assert.doesNotMatch(s.prompt!, /dining/i, 'no room/furniture content leaks into the prompt');
+  assert.doesNotMatch(s.prompt!, /sectional|sofa/i, 'no furniture named');
+  assert.doesNotMatch(s.prompt!, /\btoward\b/i, 'no directional destination for the camera');
+  assert.ok(s.prompt!.includes(FIDELITY_CONSTRAINT), 'prompt asserts the preserve-the-scene constraint');
+  assert.match(s.prompt!, /do not add, remove, move, or invent/i);
+});
+
+test('every prompt is motion + lighting + the fidelity constraint only', async () => {
+  const entries = [shotWithVision('foyer'), shotWithVision('bathroom', { lighting: 'warm' })];
+  const shots = await engine.process(build(entries), makeCtx());
+  for (const s of shots) {
+    assert.match(s.prompt!, /^Camera: /, 'starts with the camera move, not a scene description');
+    assert.ok(s.prompt!.endsWith(FIDELITY_CONSTRAINT), 'ends with the fidelity constraint');
+  }
+  assert.match(shots[1].prompt!, /Warm light;/);
+});
+
+// --- motion selection (unchanged behaviour, safe phrasing) --------------
+
+test("vision's move selects the preset but its raw directional text never reaches the prompt", async () => {
   const a = shotWithVision('kitchen', {
-    description: 'spacious open-plan kitchen with a white quartz island',
     suggestedMove: 'slow dolly-in past the island toward the blue backsplash',
   });
   const [s] = await engine.process(build([a]), makeCtx());
-  assert.match(s.prompt!, /Camera: slow dolly-in past the island toward the blue backsplash\./);
-  assert.equal(s.motionPreset, 'dolly_in');
-});
-
-test('descriptions get a correct leading article (no "the a ..." bug)', async () => {
-  const withA = shotWithVision('other', { description: 'a blank pale gray frame' });
-  const bare = shotWithVision('kitchen', { description: 'spacious open-plan kitchen' });
-  const vowel = shotWithVision('living_room', { description: 'airy open-plan living room' });
-  const [s1, s2, s3] = await engine.process(build([withA, bare, vowel]), makeCtx());
-  assert.match(s1.prompt!, /^A blank pale gray frame\./);
-  assert.match(s2.prompt!, /^A spacious open-plan kitchen\./);
-  assert.match(s3.prompt!, /^An airy open-plan living room\./);
-  assert.doesNotMatch(s1.prompt!, /the a /i);
+  assert.equal(s.motionPreset, 'dolly_in', 'preset still derived from vision');
+  assert.ok(s.prompt!.includes(safeMovePhrase('dolly_in')), 'prompt uses the neutral safe phrasing');
+  assert.doesNotMatch(s.prompt!, /island|backsplash|toward/i);
 });
 
 test('missing vision falls back to room variants and rotates on repeats', async () => {
@@ -75,7 +94,6 @@ test('missing vision falls back to room variants and rotates on repeats', async 
   assert.equal(s1.motionPreset, 'dolly_in');
   assert.equal(s2.motionPreset, 'pan', 'second bedroom rotates to a different variant');
   assert.notEqual(s1.prompt, s2.prompt);
-  assert.match(s1.prompt!, /^A bedroom\./);
 });
 
 test('identical back-to-back moves on the same room are varied', async () => {
@@ -86,11 +104,11 @@ test('identical back-to-back moves on the same room are varied', async () => {
   assert.notEqual(s2.motionPreset, 'crane_up', 'second consecutive crane is replaced');
 });
 
-test('every prompt carries the style suffix and lighting', async () => {
-  const entries = [shotWithVision('foyer'), shotWithVision('bathroom', { lighting: 'warm' })];
-  const shots = await engine.process(build(entries), makeCtx());
-  for (const s of shots) assert.ok(s.prompt!.endsWith(STYLE_SUFFIX));
-  assert.match(shots[1].prompt!, /Warm light;/);
+test('safe move phrases are non-directional (no "toward"/"into" targets)', () => {
+  for (const preset of ['push_in', 'dolly_in', 'orbit', 'crane_up', 'lateral_glide', 'pan', 'static']) {
+    const phrase = safeMovePhrase(preset);
+    assert.doesNotMatch(phrase, /toward|into|through/i, `${preset} phrase must not name a destination`);
+  }
 });
 
 test('presetFromMove keyword mapping', () => {

@@ -5,7 +5,7 @@ import type {
   ProgressEventData,
   ReviewEventData,
 } from '@rev/core';
-import { checkHealth, patchStoryboard, resumeRun, startRun, watchRun } from './api';
+import { checkHealth, patchStoryboard, resumeRun, startRun, watchRun, type VideoMode } from './api';
 import { Dropzone } from './components/Dropzone';
 import { LengthSelector, type TourLength } from './components/LengthSelector';
 import { ProgressBar } from './components/ProgressBar';
@@ -19,6 +19,7 @@ export default function App() {
   const [files, setFiles] = useState<File[]>([]);
   const [length, setLength] = useState<TourLength>(45);
   const [reviewFirst, setReviewFirst] = useState(true);
+  const [mode, setMode] = useState<VideoMode>('faithful');
   const [phase, setPhase] = useState<Phase>('idle');
   const [progress, setProgress] = useState<ProgressEventData | null>(null);
   const [review, setReview] = useState<ReviewEventData | null>(null);
@@ -63,7 +64,7 @@ export default function App() {
     setError(null);
     setProjectId(null);
     try {
-      follow(await startRun(length, usingDemo ? undefined : files, reviewFirst));
+      follow(await startRun(length, usingDemo ? undefined : files, reviewFirst, mode));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('error');
@@ -101,8 +102,8 @@ export default function App() {
   }
 
   const engineLine = health
-    ? `analysis: ${health.engines.vision === 'claude' ? 'Claude' : 'mock'} · clips: ${
-        health.engines.videogen === 'higgsfield' ? 'Higgsfield' : 'mock'
+    ? `analysis: ${health.engines.vision === 'claude' ? 'Claude' : 'mock'} · motion: ${
+        mode === 'cinematic' ? 'cinematic (AI)' : 'faithful'
       }`
     : null;
 
@@ -147,6 +148,39 @@ export default function App() {
             Review the storyboard before animating
             <span className="text-xs text-slate-500">(no clips are paid for until you approve)</span>
           </label>
+
+          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+            <p className="text-sm font-medium text-slate-200">Motion</p>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Faithful (default): a real pan/zoom over your actual photo — nothing added or invented.
+            </p>
+            <label className="mt-2 flex cursor-pointer items-start gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={mode === 'cinematic'}
+                onChange={(e) => setMode(e.target.checked ? 'cinematic' : 'faithful')}
+                disabled={busy || !health?.engines.cinematicAvailable}
+                className="mt-0.5 size-4 accent-amber-500"
+              />
+              <span>
+                Use cinematic AI motion instead
+                <span className="text-xs text-slate-500">
+                  {' '}
+                  — more lifelike, but the AI may alter or invent property details
+                </span>
+              </span>
+            </label>
+            {mode === 'cinematic' && (
+              <p className="mt-2 text-xs text-amber-400">
+                ⚠ Not guaranteed faithful. The model can add, move, or invent furniture, rooms, and
+                features. Use for general marketing only — never for a listing that must depict the
+                property accurately.
+              </p>
+            )}
+            {health && !health.engines.cinematicAvailable && (
+              <p className="mt-1 text-xs text-slate-600">(Cinematic mode needs a Higgsfield API key.)</p>
+            )}
+          </div>
 
           <button
             type="button"

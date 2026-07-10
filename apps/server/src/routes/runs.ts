@@ -5,7 +5,7 @@ import { basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { FastifyInstance } from 'fastify';
 import { defaultConfig, newId } from '@rev/core';
-import type { Project, ReviewEventData, ReviewShot, Shot } from '@rev/core';
+import type { Project, ReviewEventData, ReviewShot, Shot, VideoMode } from '@rev/core';
 import {
   loadProject,
   nextStage,
@@ -24,7 +24,7 @@ import {
   type UploadRequest,
 } from '@rev/engine-upload';
 import { ClaudeVisionEngine } from '@rev/engine-vision';
-import { HiggsfieldVideoGenEngine } from '@rev/engine-videogen';
+import { HiggsfieldVideoGenEngine, KenBurnsVideoGenEngine } from '@rev/engine-videogen';
 import { PROJECTS_DIR } from '../paths';
 import type { Run, RunEvent, RunRegistry } from '../runs';
 
@@ -34,6 +34,8 @@ interface StartRunJsonBody {
   sourceNames?: string[];
   /** Pause at the storyboard review checkpoint instead of animating straight through. */
   review?: boolean;
+  /** 'faithful' (default, Ken Burns) or 'cinematic' (generative Higgsfield). */
+  mode?: string;
 }
 
 const DEMO_SOURCES = Array.from({ length: 14 }, (_, i) => `DEMO_${String(i + 1).padStart(2, '0')}.jpg`);
@@ -53,12 +55,31 @@ function parseTarget(value: unknown): TourLength | null {
   return n === 30 || n === 45 || n === 60 ? n : null;
 }
 
-/** Engines unlocked by API keys in .env; everything else stays mock. */
-function keyedEngines(): Partial<PipelineEngines> {
-  const engines: Partial<PipelineEngines> = {};
-  if (process.env.ANTHROPIC_API_KEY) engines.vision = new ClaudeVisionEngine();
-  if (process.env.HIGGSFIELD_API_KEY) engines.videogen = new HiggsfieldVideoGenEngine();
-  return engines;
+function parseMode(value: unknown): VideoMode {
+  return String(value).toLowerCase() === 'cinematic' ? 'cinematic' : 'faithful';
+}
+
+/** Real Claude vision when the key is set; mock otherwise. */
+function keyedVision(): Partial<PipelineEngines> {
+  return process.env.ANTHROPIC_API_KEY ? { vision: new ClaudeVisionEngine() } : {};
+}
+
+/**
+ * Resolve the fidelity mode to the videogen engine that will actually run.
+ * 'faithful' (default) → Ken Burns: deterministic pan/zoom over the real
+ * photo, no invention possible, no key needed. 'cinematic' → generative
+ * Higgsfield i2v, but ONLY when its key is present; without the key we fall
+ * back to faithful rather than fail. Returns the effective mode too, so the
+ * Project records what actually ran (not merely what was asked for).
+ */
+function resolveVideogen(requested: VideoMode): {
+  engine: PipelineEngines['videogen'];
+  mode: VideoMode;
+} {
+  if (requested === 'cinematic' && process.env.HIGGSFIELD_API_KEY) {
+    return { engine: new HiggsfieldVideoGenEngine(), mode: 'cinematic' };
+  }
+  return { engine: new KenBurnsVideoGenEngine(), mode: 'faithful' };
 }
 
 /** Load a project by id, or null for bad ids / unknown projects. */
@@ -118,6 +139,7 @@ export function registerRunRoutes(
 
       let target: TourLength | null = null;
       let review = false;
+      let requestedMode: VideoMode = 'faithful';
       const sources: SourceFile[] = [];
       try {
         for await (const part of req.parts()) {
@@ -135,6 +157,8 @@ export function registerRunRoutes(
             target = parseTarget(part.value);
           } else if (part.fieldname === 'review') {
             review = ['1', 'true', 'on'].includes(String(part.value).toLowerCase());
+          } else if (part.fieldname === 'mode') {
+            requestedMode = parseMode(part.value);
           }
         }
       } catch (err) {
@@ -153,7 +177,9 @@ export function registerRunRoutes(
         });
       }
 
-      // Real photos -> real engines (each one only when its key is present).
+      // Real photos -> real upload + key-gated vision. Motion defaults to the
+      // faithful Ken Burns engine; generative i2v only on explicit opt-in.
+      const { engine: videogen, mode } = resolveVideogen(requestedMode);
       const run = registry.create();
       void trackRun(
         registry,
@@ -162,7 +188,8 @@ export function registerRunRoutes(
           runPipeline({
             request: { sources },
             targetDurationSec: target,
-            engines: { upload: new LocalUploadEngine(), ...keyedEngines() },
+            mode,
+            engines: { upload: new LocalUploadEngine(), ...keyedVision(), videogen },
             config,
             stopAfter: review ? 'prompted' : undefined,
             onProject: (projectId) => { run.projectId = projectId; },
@@ -171,7 +198,7 @@ export function registerRunRoutes(
           }),
         cleanup,
       );
-      return reply.code(202).send({ runId: run.id, photoCount: sources.length });
+      return reply.code(202).send({ runId: run.id, photoCount: sources.length, mode });
     }
 
     // JSON demo branch
@@ -258,12 +285,14 @@ export function registerRunRoutes(
       return reply.code(409).send({ error: 'This project cannot be resumed — start a new run.' });
     }
 
+    // Resume with the engine that matches how the project was generated.
+    const { engine: videogen } = resolveVideogen(project.mode ?? 'faithful');
     const run = registry.create();
     run.projectId = id;
     void trackRun(registry, run, () =>
       resumePipeline({
         projectId: id,
-        engines: keyedEngines(),
+        engines: { ...keyedVision(), videogen },
         config,
         onProgress: (pct, stage, msg) =>
           registry.emit(run.id, { type: 'progress', data: { pct, stage, msg } }),

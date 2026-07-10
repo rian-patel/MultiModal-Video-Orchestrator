@@ -16,8 +16,9 @@ import sharp from 'sharp';
 import { createLogger, defaultConfig, newId } from '@rev/core';
 import type { Asset, Engine, EngineContext } from '@rev/core';
 import type { UploadRequest } from '@rev/engine-upload';
+import type { VideoMode } from '@rev/core';
 import { ClaudeVisionEngine } from '@rev/engine-vision';
-import { HiggsfieldVideoGenEngine } from '@rev/engine-videogen';
+import { HiggsfieldVideoGenEngine, KenBurnsVideoGenEngine } from '@rev/engine-videogen';
 import { runPipeline } from '@rev/orchestrator';
 
 try {
@@ -28,6 +29,9 @@ try {
 
 const PHOTO_DIR = process.argv[2] ?? 'test-photos-real';
 const TARGET = Number(process.argv[3] ?? 30) as 30 | 45 | 60;
+// 'faithful' (default) = Ken Burns, no credits, guaranteed faithful.
+// 'cinematic' = generative Higgsfield (spends credits, can drift).
+const MODE: VideoMode = process.argv[4] === 'cinematic' ? 'cinematic' : 'faithful';
 const IMG_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 
 /** Upload without the 10-photo minimum: EXIF-rotate + normalize to JPEG. */
@@ -54,8 +58,10 @@ class SmallSetUploadEngine implements Engine<UploadRequest, Asset[]> {
 }
 
 async function main() {
-  if (!process.env.HIGGSFIELD_API_KEY) throw new Error('HIGGSFIELD_API_KEY not set in .env');
   if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set in .env');
+  if (MODE === 'cinematic' && !process.env.HIGGSFIELD_API_KEY) {
+    throw new Error('cinematic mode needs HIGGSFIELD_API_KEY in .env');
+  }
 
   const files = (await readdir(PHOTO_DIR))
     .filter((f) => IMG_EXT.has(extname(f).toLowerCase()))
@@ -66,22 +72,32 @@ async function main() {
     sources: files.map((f) => ({ originalName: f, tmpPath: join(PHOTO_DIR, f) })),
   };
 
+  const videogen =
+    MODE === 'cinematic'
+      ? new HiggsfieldVideoGenEngine({
+          maxAttempts: 1, // never resubmit -> at most one billed clip per shot
+          maxPollMs: 25 * 60_000, // safely above observed dop/standard latency
+          pollIntervalMs: 10_000,
+        })
+      : new KenBurnsVideoGenEngine();
+
   const logger = createLogger('generate-real');
-  logger.info(`${files.length} photos from ${PHOTO_DIR} -> ${TARGET}s tour (Claude vision + Higgsfield)`);
-  console.log('NOTE: ~16 min per clip observed; this will take roughly an hour.\n');
+  logger.info(`${files.length} photos from ${PHOTO_DIR} -> ${TARGET}s ${MODE} tour`);
+  console.log(
+    MODE === 'cinematic'
+      ? 'NOTE: generative i2v — spends credits, a few min per clip.\n'
+      : 'NOTE: faithful Ken Burns — no credits, real pan/zoom over your photos, seconds.\n',
+  );
 
   const t0 = Date.now();
   const { project, render } = await runPipeline({
     request,
     targetDurationSec: TARGET,
+    mode: MODE,
     engines: {
       upload: new SmallSetUploadEngine(),
       vision: new ClaudeVisionEngine(),
-      videogen: new HiggsfieldVideoGenEngine({
-        maxAttempts: 1, // never resubmit -> at most one billed clip per shot
-        maxPollMs: 25 * 60_000, // safely above observed dop/standard latency
-        pollIntervalMs: 10_000,
-      }),
+      videogen,
     },
     onProgress: (pct, stage, msg) => logger.info(`[${String(pct).padStart(3)}%] ${stage.padEnd(11)} ${msg}`),
   });

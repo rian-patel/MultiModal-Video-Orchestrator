@@ -1,11 +1,41 @@
 import type { RoomType } from '@rev/core';
 
 /**
- * Shared cinematic grammar appended to every prompt. Keeps image-to-video
- * output stable: no invented people, no text artifacts, smooth motion.
+ * Fidelity constraint appended to every image-to-video prompt. For real-estate
+ * use the model must NOT embellish the property, so this is a hard instruction
+ * to preserve the source exactly — the single most important lever we have on
+ * the generative (cinematic) path, since the DoP endpoint has no negative-prompt
+ * field. Paired with removing all declarative scene description from the prompt
+ * (see index.ts): the image supplies the content, the prompt supplies only the
+ * camera move + mood.
  */
-export const STYLE_SUFFIX =
-  'Photoreal, smooth stabilized camera, cinematic 24fps motion, gentle parallax, no people, no on-screen text.';
+export const FIDELITY_CONSTRAINT =
+  'Preserve the real space exactly: do not add, remove, move, or invent any furniture, ' +
+  'objects, rooms, doorways, windows, walls, or fixtures; keep the existing layout and ' +
+  'every existing object unchanged. Photoreal, subtle natural camera motion, minimal ' +
+  'camera travel, no people, no on-screen text, no new scenery.';
+
+/**
+ * Neutral, non-directional camera phrasing keyed by motion preset. Deliberately
+ * avoids "toward the X" targets and large translational moves — a prompt that
+ * names a destination invites the model to synthesize (and thus fabricate) it.
+ */
+export const SAFE_MOVE_PHRASE: Record<string, string> = {
+  push_in: 'a slow, subtle push-in with minimal travel',
+  dolly_in: 'a slow, subtle push-in with minimal travel',
+  macro_push: 'a slow, subtle push-in on the existing detail',
+  pullback: 'a slow, gentle pull-back with minimal travel',
+  aerial_pullback: 'a slow, gentle pull-back with minimal travel',
+  lateral_glide: 'a slow lateral glide',
+  pan: 'a slow, gentle pan',
+  tilt_up: 'a slow, gentle upward tilt',
+  crane_up: 'a slow, gentle upward tilt',
+  orbit: 'a subtle slow drift',
+  static: 'an almost-static hold with the faintest drift',
+};
+
+export const safeMovePhrase = (preset: string): string =>
+  SAFE_MOVE_PHRASE[preset] ?? 'a slow, subtle push-in with minimal travel';
 
 export interface PromptVariant {
   /** Higgsfield motion preset id. */

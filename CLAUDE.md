@@ -46,7 +46,7 @@ Upload → Vision → Storyboard → Prompt → VideoGen → Render → download
 | **Vision** | `Asset[]` → `VisionResult[]` | Claude vision | local CLIP, GPT-4V |
 | **Storyboard** | `{assets,vision,targetDurationSec}` → `Shot[]` | rule-based order + **select best N** + durations | LLM narrative order |
 | **Prompt** | `{shots,vision}` → `Shot[]` | vision-move + room-variant composer (see Phase 4 notes) | LLM prompts |
-| **VideoGen** | `{shots,assets}` → `Shot[]` | Higgsfield (submit/poll/download) | Runway/Kling/Luma |
+| **VideoGen** | `{shots,assets}` → `Shot[]` | **Ken Burns (faithful, default)** / Higgsfield (cinematic, opt-in) | Runway/Kling/Luma |
 | **Render** | `{shots,outputPath}` → `RenderResult` | FFmpeg | Remotion |
 
 ### The Engine contract (`@rev/core`)
@@ -95,10 +95,11 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
 ```
 
 ### Server API (stable shape)
-- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
-- `POST /api/runs` — two content types (both accept a **review** flag: multipart field
-  `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
-  SSE `review` instead of animating straight through — no clip spend until approval):
+- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: 'ken-burns', cinematicAvailable: boolean } }` — faithful is always the default; `cinematicAvailable` = Higgsfield key present. UI header displays it.
+- `POST /api/runs` — two content types. Both accept a **review** flag (multipart
+  `review=1` / JSON `review:true` → pause at 'prompted', emit SSE `review`, no spend
+  until approval) and a **mode** field (`faithful` default | `cinematic`; multipart
+  `mode=` / JSON `mode:` → faithful=Ken Burns, cinematic=Higgsfield-if-keyed):
   - `multipart/form-data`: real photos. Fields: `targetDurationSec` (30|45|60) +
     `photos` file parts (10–40, ≤30 MB each). Streamed to `%TMP%/rev-uploads/<id>/`,
     run through the real `LocalUploadEngine` (engine override), temp dir removed
@@ -150,6 +151,51 @@ Per photo: sharp `.rotate()` (applies EXIF orientation) → normalized JPEG q92 
 `workDir/source/<assetId>.jpg` → true post-rotation dims onto `Asset` → 320px thumb
 in `workDir/thumbs/`. Downstream engines can assume upright, consistent JPEGs.
 Non-image bytes fail the run with a per-file message.
+
+## Fidelity: faithful by default, generative opt-in (the anti-hallucination architecture)
+
+Real-estate video has a hard requirement the generative model can't meet on its own:
+**never invent or alter the property** (inventing furniture/rooms/features is a legal
+liability). Root cause found live: an image-to-video model synthesizes new pixels for
+any area a camera move reveals; a *translational* move (dolly-in/orbit/crane) toward a
+prompt-named target ("dolly-in toward the dining room") makes it fabricate that target —
+it invented a dining table in the dolly path even though the real one sat off through a
+doorway. Prompt design amplified it (declarative scene descriptions + directional moves).
+
+The system now makes fidelity **structural**, not a prompt we hope holds. Two modes,
+`Project.mode` (`@rev/core` `VideoMode`), default **`faithful`**:
+
+- **`faithful` (default) — `KenBurnsVideoGenEngine` (`videogen:ken-burns`)**: a real
+  pan/zoom over the ACTUAL photo via FFmpeg `zoompan` (super-sampled 2× for smoothness,
+  cover-crop to output AR, then zoom/pan within real pixels). Every output pixel is
+  sampled from the source, so **no object/room/feature can ever be invented — the
+  guarantee is by construction**. No API, no credits, seconds per clip. `motionPreset`
+  maps to a safe move (`kenBurnsMove`): translational i2v presets (dolly/orbit/crane)
+  degrade to an honest zoom/tilt. This is what real-photo runs use unless cinematic is
+  explicitly requested.
+- **`cinematic` (opt-in) — `HiggsfieldVideoGenEngine`**: generative i2v, only when the
+  Higgsfield key is set (else falls back to faithful). Even here we minimize drift
+  (defense in depth, since the DoP endpoint has no negative-prompt field): the Prompt
+  engine is **fidelity-first** — it emits NO declarative scene description (the image is
+  the sole authority on contents), only a neutral non-directional camera move
+  (`safeMovePhrase`, no "toward X") + lighting + a hard `FIDELITY_CONSTRAINT` ("do not
+  add, remove, move, or invent … keep every existing object unchanged").
+
+Selection lives in the server (`resolveVideogen`): faithful→Ken Burns, cinematic→
+Higgsfield-if-keyed. `POST /api/runs` takes `mode` (multipart field or JSON); the UI has
+a "cinematic AI motion" opt-in (default off) with a fidelity warning; `/api/health`
+reports `videogen:'ken-burns'` + `cinematicAvailable`. Verified: the exact living-room
+shot that fabricated a table now renders a faithful push-in — real dining table in its
+real place, nothing invented (7/7 clips, 30s, 0 credits, ~48s). `scripts/generate-real.ts
+<dir> <sec> [faithful|cinematic]` runs either mode.
+
+**Remaining limitation (inherent):** only the faithful path is a hard guarantee. The
+cinematic path reduces but cannot eliminate drift — prompts/constraints are soft, and
+the DoP endpoint lacks a negative prompt and (on the REST model-path we use) an
+`enhance_prompt:false`/`strength` control. A future automated frame-validation stage
+(sample clip frames, ask Claude "anything not in the source?", fall back to Ken Burns)
+is the designed next layer, deferred because the default is already a hard guarantee;
+the seam is a swappable post-videogen stage.
 
 ## External dependencies / keys
 
