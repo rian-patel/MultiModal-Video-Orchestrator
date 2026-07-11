@@ -8,6 +8,7 @@ export function registerHealthRoutes(app: FastifyInstance): void {
     engines: {
       vision: process.env.ANTHROPIC_API_KEY ? 'claude' : 'mock',
       videogen: process.env.HIGGSFIELD_API_KEY ? 'higgsfield' : 'mock',
+      fidelity: process.env.ANTHROPIC_API_KEY ? 'claude' : 'mock',
     },
   }));
 }

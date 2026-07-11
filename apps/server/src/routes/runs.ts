@@ -24,6 +24,7 @@ import {
   type UploadRequest,
 } from '@rev/engine-upload';
 import { ClaudeVisionEngine } from '@rev/engine-vision';
+import { ClaudeFidelityEngine } from '@rev/engine-fidelity';
 import { HiggsfieldVideoGenEngine } from '@rev/engine-videogen';
 import { PROJECTS_DIR } from '../paths';
 import type { Run, RunEvent, RunRegistry } from '../runs';
@@ -56,7 +57,10 @@ function parseTarget(value: unknown): TourLength | null {
 /** Engines unlocked by API keys in .env; everything else stays mock. */
 function keyedEngines(): Partial<PipelineEngines> {
   const engines: Partial<PipelineEngines> = {};
-  if (process.env.ANTHROPIC_API_KEY) engines.vision = new ClaudeVisionEngine();
+  if (process.env.ANTHROPIC_API_KEY) {
+    engines.vision = new ClaudeVisionEngine();
+    engines.fidelity = new ClaudeFidelityEngine();
+  }
   if (process.env.HIGGSFIELD_API_KEY) engines.videogen = new HiggsfieldVideoGenEngine();
   return engines;
 }

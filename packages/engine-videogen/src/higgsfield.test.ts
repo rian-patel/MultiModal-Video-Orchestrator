@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { defaultConfig } from '@rev/core';
 import type { Asset, EngineContext, Shot } from '@rev/core';
-import { HiggsfieldVideoGenEngine } from './higgsfield';
+import { HiggsfieldVideoGenEngine, MOTION_IDS } from './higgsfield';
 
 function makeCtx(workDir: string): EngineContext {
   const noop = () => {};
@@ -41,11 +41,20 @@ async function setup(shotCount: number) {
 
 const CLIP_BYTES = Buffer.from('fake-mp4-bytes');
 
+/** The v2 submit body shape (POST /v1/image2video/dop). */
+interface SubmitParams {
+  prompt: string;
+  input_images: Array<{ type: string; image_url: string }>;
+  model: string;
+  motions: Array<{ id: string; strength: number }>;
+  enhance_prompt: boolean;
+}
+
 /**
- * Fake platform API modelling the real flow: image upload (get presigned URL,
- * PUT bytes) -> submit -> request_id -> one in_progress poll -> completed with
- * a download URL. `failSubmits` makes the first N submit calls return HTTP 500;
- * `failRooms` marks matching request ids failed.
+ * Fake platform v2 API modelling the real flow: image upload (get presigned
+ * URL, PUT bytes) -> submit to /v1/image2video/dop -> job-set id -> one
+ * in_progress poll -> completed with a download URL. `failSubmits` makes the
+ * first N submit calls return HTTP 500; `failRooms` marks matching ids failed.
  */
 function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
   let submitCount = 0;
@@ -53,6 +62,7 @@ function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
   let failSubmitsLeft = opts.failSubmits ?? 0;
   const polls = new Map<string, number>();
   const submittedPrompts: string[] = [];
+  const submittedParams: SubmitParams[] = [];
   const putUploads: string[] = [];
 
   const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
@@ -75,18 +85,31 @@ function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
       putUploads.push(u);
       return new Response(null, { status: 200 });
     }
-    // 3. submit generation
+    // 3. submit generation (v2 endpoint, {params:{...}} envelope)
     if (init?.method === 'POST') {
-      const body = JSON.parse(String(init.body)) as { prompt: string; image_url: string };
-      assert.match(body.image_url, /^https:\/\/cdn\.example\/img\//, 'image_url is the hosted URL');
-      assert.ok(body.image_url.length <= 2083, 'image_url within the platform URL limit');
+      assert.ok(u.endsWith('/v1/image2video/dop'), `submit goes to the v2 endpoint, got ${u}`);
+      const { params } = JSON.parse(String(init.body)) as { params: SubmitParams };
+      const imageUrl = params.input_images[0]?.image_url ?? '';
+      assert.match(imageUrl, /^https:\/\/cdn\.example\/img\//, 'image_url is the hosted URL');
+      assert.ok(imageUrl.length <= 2083, 'image_url within the platform URL limit');
+      assert.equal(params.enhance_prompt, false, 'prompt enhancer is always disabled');
+      assert.equal(params.motions.length, 1, 'exactly one motion preset per shot');
+      assert.ok(
+        params.motions[0].strength >= 0 && params.motions[0].strength <= 1,
+        'motion strength within the API bounds 0..1',
+      );
+      assert.ok(
+        ['dop-turbo', 'dop-lite', 'dop-preview'].includes(params.model),
+        `model within the v2 enum, got ${params.model}`,
+      );
       if (failSubmitsLeft > 0) {
         failSubmitsLeft--;
         return new Response('boom', { status: 500 });
       }
-      const id = `req_${submitCount++}_${body.prompt.replace(/\W/g, '_')}`;
-      submittedPrompts.push(body.prompt);
-      return Response.json({ request_id: id });
+      const id = `req_${submitCount++}_${params.prompt.replace(/\W/g, '_')}`;
+      submittedPrompts.push(params.prompt);
+      submittedParams.push(params);
+      return Response.json({ id });
     }
     if (u.includes('/requests/')) {
       const id = u.split('/requests/')[1].split('/')[0];
@@ -102,7 +125,7 @@ function fakeApi(opts: { failSubmits?: number; failRooms?: Set<string> } = {}) {
     return new Response(CLIP_BYTES, { status: 200 });
   }) as typeof fetch;
 
-  return { fetchImpl, submittedPrompts, putUploads };
+  return { fetchImpl, submittedPrompts, submittedParams, putUploads };
 }
 
 function makeEngine(fetchImpl: typeof fetch, extra: Record<string, unknown> = {}) {
@@ -130,6 +153,25 @@ test('happy path: submits prompt, polls to completion, downloads clip', async ()
   }
   assert.deepEqual(api.submittedPrompts.sort(), ['prompt 0', 'prompt 1', 'prompt 2']);
   assert.equal(api.putUploads.length, 3, 'each shot uploaded its image before submit');
+});
+
+test('fidelity knobs: motion preset maps to catalog UUID, strength + model are applied', async () => {
+  const { workDir, assets, shots } = await setup(2);
+  shots[0].motionPreset = 'lateral_glide';
+  shots[1].motionPreset = 'no_such_preset';
+  const api = fakeApi();
+  // Legacy model value must be normalized into the v2 enum, not sent verbatim.
+  const engine = makeEngine(api.fetchImpl, { motionStrength: 0.22, model: 'higgsfield-ai/dop/standard' });
+  const out = await engine.process({ shots, assets }, makeCtx(workDir));
+
+  assert.equal(out.filter((s) => s.status === 'done').length, 2);
+  const byPrompt = new Map(api.submittedParams.map((p) => [p.prompt, p]));
+  const glide = byPrompt.get('prompt 0')!;
+  assert.equal(glide.motions[0].id, MOTION_IDS.lateral_glide, 'preset mapped to its catalog UUID');
+  assert.equal(glide.motions[0].strength, 0.22, 'configured low strength is sent');
+  assert.equal(glide.model, 'dop-turbo', 'legacy model name normalized to the v2 default');
+  const unknown = byPrompt.get('prompt 1')!;
+  assert.equal(unknown.motions[0].id, MOTION_IDS.dolly_in, 'unknown preset falls back to Dolly In');
 });
 
 test('transient submit failure is retried within the shot', async () => {

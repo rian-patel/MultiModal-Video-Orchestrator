@@ -9,6 +9,7 @@
       "@rev/engine-storyboard": ["packages/engine-storyboard/src/index.ts"],
       "@rev/engine-prompt": ["packages/engine-prompt/src/index.ts"],
       "@rev/engine-videogen": ["packages/engine-videogen/src/index.ts"],
+      "@rev/engine-fidelity": ["packages/engine-fidelity/src/index.ts"],
       "@rev/engine-render": ["packages/engine-render/src/index.ts"],
       "@rev/orchestrator": ["packages/orchestrator/src/index.ts"]
     }

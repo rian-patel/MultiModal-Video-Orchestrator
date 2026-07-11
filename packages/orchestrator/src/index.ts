@@ -19,6 +19,7 @@ import { MockVisionEngine } from '@rev/engine-vision';
 import { RuleBasedStoryboardEngine, type StoryboardInput } from '@rev/engine-storyboard';
 import { TemplatePromptEngine, type PromptInput } from '@rev/engine-prompt';
 import { MockVideoGenEngine, type VideoGenInput } from '@rev/engine-videogen';
+import { MockFidelityEngine, type FidelityInput } from '@rev/engine-fidelity';
 import { FfmpegRenderEngine, type RenderInput, type RenderResult } from '@rev/engine-render';
 import { ensureProjectDirs, loadProject, saveProject } from './persistence';
 
@@ -31,6 +32,8 @@ export interface PipelineEngines {
   storyboard: Engine<StoryboardInput, Shot[]>;
   prompt: Engine<PromptInput, Shot[]>;
   videogen: Engine<VideoGenInput, Shot[]>;
+  /** Post-videogen audit: drops clips that drift from their source photo. */
+  fidelity: Engine<FidelityInput, Shot[]>;
   render: Engine<RenderInput, RenderResult>;
 }
 
@@ -46,6 +49,7 @@ export function defaultEngines(): PipelineEngines {
     storyboard: new RuleBasedStoryboardEngine(),
     prompt: new TemplatePromptEngine(),
     videogen: new MockVideoGenEngine(),
+    fidelity: new MockFidelityEngine(),
     render: new FfmpegRenderEngine(),
   };
 }
@@ -222,11 +226,18 @@ async function executeFrom(
     }
 
     // 5. Video generation — checkpoint *before* the expensive stage so a
-    //    crash mid-generation resumes here, not at prompt.
+    //    crash mid-generation resumes here, not at prompt. The fidelity audit
+    //    runs inside this stage: a clip that drifted from its source photo is
+    //    marked 'failed' (render skips it; resume regenerates it).
     if (start <= 4) {
       project.stage = 'generating';
       await saveProject(workDir, project);
       project.shots = await generateClips(project, engines.videogen, ctxFor(4, 'videogen'));
+      await saveProject(workDir, project);
+      project.shots = await engines.fidelity.process(
+        { shots: project.shots, assets: project.assets },
+        ctxFor(4, 'fidelity'),
+      );
       await saveProject(workDir, project);
     }
 
@@ -270,7 +281,8 @@ async function generateClips(
     if (shot.status === 'done' && shot.clipPath && (await fileExists(shot.clipPath))) {
       keep.push(shot);
     } else {
-      todo.push({ ...shot, status: 'pending', clipPath: undefined });
+      // A regenerated clip must be re-audited, so the fidelity flag is shed.
+      todo.push({ ...shot, status: 'pending', clipPath: undefined, fidelityChecked: undefined });
     }
   }
 

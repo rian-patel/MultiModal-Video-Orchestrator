@@ -4,12 +4,23 @@ import { mapWithConcurrency } from '@rev/core';
 import type { Engine, EngineContext, Shot } from '@rev/core';
 import type { VideoGenInput } from './types';
 
+/** v2 DoP model variants (POST /v1/image2video/dop `params.model`). */
+export type DopModel = 'dop-turbo' | 'dop-lite' | 'dop-preview';
+
 export interface HiggsfieldOptions {
   /** Platform API credentials, "key:secret" (docs.higgsfield.ai). */
   apiKey?: string;
-  /** Model path, e.g. "higgsfield-ai/dop/standard". */
+  /** DoP model variant. Unknown/legacy values are normalized to the default. */
   model?: string;
   baseUrl?: string;
+  /**
+   * Motion strength 0..1 sent with every motion preset. THE fidelity lever:
+   * lower strength = less camera travel = less occluded geometry the model
+   * must synthesize = less room to hallucinate. 0.3 verified live (2026-07):
+   * faithful reproduction of the living-room photo, drift confined to
+   * door-reveal details, vs. a fabricated kitchen+person at default strength.
+   */
+  motionStrength?: number;
   maxConcurrency?: number;
   pollIntervalMs?: number;
   /** Give up polling one clip after this long. */
@@ -21,8 +32,9 @@ export interface HiggsfieldOptions {
 }
 
 interface SubmitResponse {
-  request_id?: string;
+  /** v2 job-set id — accepted by the legacy /requests/{id}/status route. */
   id?: string;
+  request_id?: string;
 }
 
 interface UploadLinkResponse {
@@ -36,23 +48,50 @@ interface StatusResponse {
   video_url?: string;
 }
 
+const DEFAULT_MODEL: DopModel = 'dop-turbo';
+const DOP_MODELS: ReadonlySet<string> = new Set(['dop-turbo', 'dop-lite', 'dop-preview']);
+
 /**
- * Real VideoGen engine against the Higgsfield platform REST API
- * (https://platform.higgsfield.ai — fal-style queue):
+ * Our motion presets (see engine-prompt/templates.ts) mapped onto Higgsfield's
+ * motion catalog (GET /v1/motions — ids are stable UUIDs). Only low-travel,
+ * non-destructive camera moves; anything unknown falls back to Dolly In.
+ */
+export const MOTION_IDS: Record<string, string> = {
+  push_in: '81ca2cd2-05db-4222-9ba0-a32e5185adfb', // Dolly In
+  dolly_in: '81ca2cd2-05db-4222-9ba0-a32e5185adfb', // Dolly In
+  macro_push: 'fbcbec5b-30f8-4b17-ba6e-8e8d5b265562', // Zoom In
+  pullback: '12ac8798-5370-4801-91a6-f1acb425fc4a', // Dolly Out
+  aerial_pullback: '12ac8798-5370-4801-91a6-f1acb425fc4a', // Dolly Out
+  lateral_glide: '15ddc007-4723-42c1-8446-2af69af4879f', // Dolly Right
+  pan: '71f0f8bc-0e5d-4d32-b34f-bd74a5e3cba8', // Dolly Left
+  tilt_up: '2c9af101-fe7a-4299-91f3-e44431a0576f', // Tilt up
+  crane_up: '68af9add-43ea-4261-a706-16b640fdcff9', // Crane Up
+  orbit: 'a85cb3f2-f2be-4ee2-b3b9-808fc6a81acc', // Arc Right
+  static: 'fa3ddb7c-53ee-4383-aa17-97ae65f180e5', // Static
+};
+const FALLBACK_MOTION_ID = MOTION_IDS.dolly_in;
+
+/**
+ * Real VideoGen engine against the Higgsfield platform v2 API
+ * (https://platform.higgsfield.ai, schema probed live 2026-07):
  *   POST /files/generate-upload-url { content_type } -> { upload_url, public_url }
  *   PUT  {upload_url} (raw image bytes)              -> (image now hosted)
- *   POST /{model}  { image_url, prompt, duration }   -> { request_id }
+ *   POST /v1/image2video/dop { params: { prompt, input_images, model,
+ *        motions: [{id, strength}], enhance_prompt } } -> { id, jobs: [...] }
  *   GET  /requests/{id}/status                       -> { status, video.url }
- * Per shot: upload image -> hosted URL -> submit -> poll -> download to
- * workDir/clips. (image_url must be a real URL ≤2083 chars, NOT a data URI —
- * the platform rejects data URIs with 422 url_too_long.) Failures are isolated
- * per shot (status 'failed'); the run only fails when every clip fails.
+ * The v2 endpoint exists specifically for its `motions[].strength` (0..1) —
+ * the legacy POST /{model} path cannot limit camera travel, and unrestrained
+ * travel is what caused property hallucination. (image_url must be a hosted
+ * URL ≤2083 chars, NOT a data URI — 422 url_too_long. Clip length is fixed by
+ * the model, ~5s; there is no duration param.) Failures are isolated per shot
+ * (status 'failed'); the run only fails when every clip fails.
  */
 export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
   readonly name = 'videogen:higgsfield';
   private apiKey: string;
-  private model: string;
+  private model: DopModel;
   private baseUrl: string;
+  private motionStrength: number;
   private maxConcurrency: number;
   private pollIntervalMs: number;
   private maxPollMs: number;
@@ -61,12 +100,17 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
 
   constructor(opts: HiggsfieldOptions = {}) {
     this.apiKey = opts.apiKey ?? process.env.HIGGSFIELD_API_KEY ?? '';
-    this.model = opts.model ?? process.env.HIGGSFIELD_MODEL ?? 'higgsfield-ai/dop/standard';
+    const rawModel = opts.model ?? process.env.HIGGSFIELD_MODEL ?? DEFAULT_MODEL;
+    // Legacy configs may still say e.g. "higgsfield-ai/dop/standard" — the v2
+    // endpoint rejects anything outside its enum, so normalize.
+    this.model = (DOP_MODELS.has(rawModel) ? rawModel : DEFAULT_MODEL) as DopModel;
     this.baseUrl = (opts.baseUrl ?? 'https://platform.higgsfield.ai').replace(/\/+$/, '');
+    const rawStrength = opts.motionStrength ?? Number(process.env.HIGGSFIELD_MOTION_STRENGTH ?? 0.3);
+    this.motionStrength = Math.min(1, Math.max(0, Number.isFinite(rawStrength) ? rawStrength : 0.3));
     // Higgsfield starter plans allow max 2 concurrent jobs (observed live).
     this.maxConcurrency = opts.maxConcurrency ?? 2;
     this.pollIntervalMs = opts.pollIntervalMs ?? 5_000;
-    // dop/standard is usually a few min but has been seen near ~16 min under
+    // dop generation is usually a few min but has been seen near ~16 min under
     // load; keep the ceiling well above that so a slow-but-fine clip is never
     // falsely timed out (a timeout no longer resubmits, but it does lose the
     // paid clip). See generateShot for the retry split.
@@ -100,7 +144,7 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     if (ok === 0) {
       throw new Error(`All ${shots.length} clip generations failed — cannot produce a video.`);
     }
-    ctx.logger.info(`Generated ${ok}/${shots.length} clips via ${this.model}`);
+    ctx.logger.info(`Generated ${ok}/${shots.length} clips via ${this.model} @ strength ${this.motionStrength}`);
     return shots;
   }
 
@@ -122,7 +166,7 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     let requestId: string | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       try {
-        requestId = await this.submit(sourcePath, shot, ctx);
+        requestId = await this.submit(sourcePath, shot);
         break;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
@@ -147,33 +191,39 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     }
   }
 
-  private async submit(sourcePath: string, shot: Shot, ctx: EngineContext): Promise<string> {
+  private async submit(sourcePath: string, shot: Shot): Promise<string> {
     // Local-first app: photos aren't publicly reachable, and the platform
     // rejects data URIs (422 url_too_long, 2083-char cap). So upload the image
     // to Higgsfield's CDN first and submit the returned hosted URL.
     const imageUrl = await this.uploadImage(sourcePath);
-    const res = await this.fetch(`${this.baseUrl}/${this.model}`, {
+    const motionId = MOTION_IDS[shot.motionPreset ?? ''] ?? FALLBACK_MOTION_ID;
+    const res = await this.fetch(`${this.baseUrl}/v1/image2video/dop`, {
       method: 'POST',
       headers: {
         authorization: `Key ${this.apiKey}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        image_url: imageUrl,
-        prompt: shot.prompt ?? 'A slow, subtle push-in with minimal travel. Photoreal, no people.',
-        duration: Math.max(1, Math.ceil(ctx.config.clipDurationSec)),
-        // Disable the platform's prompt "enhancer" — it embellishes the prompt
-        // and is a source of invented detail. Verified accepted by the DoP
-        // endpoint (fidelity over creativity for real-estate accuracy).
-        enhance_prompt: false,
+        params: {
+          prompt: shot.prompt ?? 'A slow, subtle push-in with minimal travel. Photoreal, no people.',
+          input_images: [{ type: 'image_url', image_url: imageUrl }],
+          model: this.model,
+          // Low strength caps camera travel (fidelity); the preset picks the
+          // move direction the Prompt engine chose for this room.
+          motions: [{ id: motionId, strength: this.motionStrength }],
+          // Disable the platform's prompt "enhancer" — it embellishes the
+          // prompt and is a source of invented detail (fidelity over
+          // creativity for real-estate accuracy).
+          enhance_prompt: false,
+        },
       }),
     });
     if (!res.ok) {
       throw new Error(`submit failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     }
     const body = (await res.json()) as SubmitResponse;
-    const id = body.request_id ?? body.id;
-    if (!id) throw new Error('submit response had no request_id');
+    const id = body.id ?? body.request_id;
+    if (!id) throw new Error('submit response had no job id');
     return id;
   }
 

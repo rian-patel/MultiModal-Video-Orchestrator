@@ -37,7 +37,7 @@ Design goal: **maximum automation, minimum input.** And **modular from day one**
 Data flows down a pipeline. Each **engine** is a pure transform with a narrow, testable I/O. The **orchestrator** reads the needed slice of `Project`, calls the engine, writes the result back, persists, and emits progress. Engines never call each other — that's what makes them swappable.
 
 ```
-Upload → Vision → Storyboard → Prompt → VideoGen → Render → download
+Upload → Vision → Storyboard → Prompt → VideoGen → Fidelity → Render → download
 ```
 
 | Engine | Input → Output | MVP impl | Swap-in later |
@@ -47,7 +47,11 @@ Upload → Vision → Storyboard → Prompt → VideoGen → Render → download
 | **Storyboard** | `{assets,vision,targetDurationSec}` → `Shot[]` | rule-based order + **select best N** + durations | LLM narrative order |
 | **Prompt** | `{shots,vision}` → `Shot[]` | vision-move + room-variant composer (see Phase 4 notes) | LLM prompts |
 | **VideoGen** | `{shots,assets}` → `Shot[]` | Higgsfield (submit/poll/download) | Runway/Kling/Luma |
+| **Fidelity** | `{shots,assets}` → `Shot[]` | Claude audits clip frames vs source photo; drift ⇒ shot 'failed' | frame-diff heuristics |
 | **Render** | `{shots,outputPath}` → `RenderResult` | FFmpeg | Remotion |
+
+(Fidelity runs *inside* the videogen stage checkpoint — no new `ProjectStage`; a
+dropped clip is a per-shot 'failed', which render skips and resume regenerates.)
 
 ### The Engine contract (`@rev/core`)
 ```ts
@@ -80,6 +84,7 @@ packages/
   engine-storyboard/ @rev/engine-storyboard
   engine-prompt/     @rev/engine-prompt
   engine-videogen/   @rev/engine-videogen
+  engine-fidelity/   @rev/engine-fidelity — post-videogen hallucination audit
   engine-render/     @rev/engine-render
   orchestrator/      @rev/orchestrator — pipeline runner + persistence + progress
 apps/
@@ -95,7 +100,7 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
 ```
 
 ### Server API (stable shape)
-- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
+- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock, fidelity: claude|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
 - `POST /api/runs` — two content types (both accept a **review** flag: multipart field
   `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
   SSE `review` instead of animating straight through — no clip spend until approval):
@@ -174,20 +179,38 @@ generative Higgsfield path is the product; we harden it toward fidelity instead:
   Vision's photo-specific move still selects the motion *preset*, but its free-text
   (which may name a destination) never reaches the prompt.
 - **`enhance_prompt: false`** in the Higgsfield submit body — disables the platform's
-  prompt "enhancer" (it embellishes and invents detail). Verified the DoP endpoint
-  accepts the field (a bad-image 422 flagged only `image_url`, not `enhance_prompt`).
+  prompt "enhancer" (it embellishes and invents detail). On the v2 endpoint the field is
+  schema-validated (bool), so it is guaranteed honored.
+- **Low motion strength (v2 endpoint, 2026-07)**: videogen now submits to
+  `POST /v1/image2video/dop` with `motions: [{id, strength}]`, default **strength 0.3**
+  (`HIGGSFIELD_MOTION_STRENGTH`, 0..1). Less camera travel = less occluded geometry the
+  model must synthesize = less room to invent. Verified live on the living-room photo
+  that caused the original hallucination: all visible content preserved (no people, no
+  invented furniture/rooms); residual drift confined to door-reveal details.
+- **Fidelity engine backstop** (`fidelity:claude`, `packages/engine-fidelity`): after
+  videogen, Claude compares 4 sampled frames per clip (1 anchor near t=0 + 3 across the
+  back half, ≤1568px) against the source photo (structured verdict faithful|drift, rubric
+  tuned for materiality: people/added furniture/layout changes/contradicting reveals =
+  drift; softness/lighting/text-morph/plausible sliver continuations = fine). Drift ⇒
+  shot 'failed' → skipped from the cut; resume regenerates it (flag `fidelityChecked`
+  skips re-audits of kept clips; regenerated shots shed the flag). FAIL-OPEN: an audit
+  error keeps the paid clip, unflagged, for a later re-audit. Wired when
+  `ANTHROPIC_API_KEY` is set; demo/keyless runs use the pass-through `fidelity:mock`.
+  Verified live on the prototype clip: correctly caught a genuinely invented
+  hearth-like fixture in a door reveal (verdict 'drift' — that clip would be
+  regenerated). Known limit: it can misread nested-doorway geometry and cite a real
+  object as missing, biasing strict — costs a regen, never ships a fabrication.
+  Auditor false-positive rate should be watched on the next full real run.
 
-**This reduces but cannot eliminate drift** — a generative model always has latitude, and
-the DoP REST endpoint has no negative-prompt field. Further levers, not yet applied:
-migrate to the SDK v2 endpoint (`/v1/image2video/dop`) for a low motion `strength`
-(less camera travel = less synthesis) and to guarantee `enhance_prompt` is honored; and
-an automated frame-validation stage (sample clip frames, ask Claude "anything not in the
-source?", regenerate/skip on drift). Both are documented Phase-9 options.
+**Residual risk** — a generative model always has latitude; strength 0.3 + the audit
+make drift rare and caught, not impossible.
 
 ## External dependencies / keys
 
 - `ANTHROPIC_API_KEY` — Claude vision. **Set in `.env` (gitignored) since Phase 2.**
 - `HIGGSFIELD_API_KEY` — video generation, from **cloud.higgsfield.ai** (`/api-keys` after sign-in) — separate product/credit pool from the consumer subscription the MCP connector uses; `platform.higgsfield.ai` is an API-only host with no dashboard UI, not the signup page. Engine auto-activates when set. Format documented as `key:secret` as of Phase 5's prototyping (see below) — reverify against the dashboard's actual output before first real run, since Higgsfield's own docs describe a single bearer token. MCP connector remains usable in-session for prototyping.
+- Optional videogen tuning: `HIGGSFIELD_MODEL` (dop-turbo | dop-lite | dop-preview) and
+  `HIGGSFIELD_MOTION_STRENGTH` (0..1, default 0.3 — the fidelity lever).
 - FFmpeg bundled via `ffmpeg-static` (Phase 6) — no system install.
 - Copy `.env.example` → `.env`.
 
@@ -229,10 +252,22 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
   hard `FIDELITY_CONSTRAINT`. Vision's `suggestedMove` still selects the motion preset
   (`presetFromMove`); per-room variants fall back/rotate; identical back-to-back moves
   auto-vary. Tests rewritten to assert the anti-hallucination guarantees.
-- [x] **Phase 5 — VideoGen Engine (Higgsfield)** — Prototyped via MCP: kitchen photo + Phase 4 prompt → real 5s clip (`projects/prototype/kitchen-dolly-in.mp4`, model `cinematic_studio_video_v2`, 5 credits, sound off; balance was 191 credits, kling3_0=7.5cr, seedance=17.5cr). Production `HiggsfieldVideoGenEngine` (`videogen:higgsfield`) targets the platform REST API (docs.higgsfield.ai): `POST /{model}` `{image_url(data URI), prompt, duration}` w/ `Authorization: Key key:secret` → poll `GET /requests/{id}/status` (queued|in_progress|completed|failed|nsfw) → download `video.url` to `workDir/clips/`. Concurrency 3, 2 attempts/shot, per-shot failure isolation (all-fail → error). Default model `higgsfield-ai/dop/standard` (override via `HIGGSFIELD_MODEL`). 5 unit tests w/ injected fetch. Server swaps it in when `HIGGSFIELD_API_KEY` (format `key:secret`) is in `.env`. VideoGen input widened to `{shots, assets}` (engine needs source images). **REST path now verified live (2026-07)** — see the Higgsfield-integration note below; the original data-URI image assumption was wrong and has been fixed to a CDN upload.
+- [x] **Phase 5 — VideoGen Engine (Higgsfield)** — Prototyped via MCP: kitchen photo + Phase 4 prompt → real 5s clip (`projects/prototype/kitchen-dolly-in.mp4`, model `cinematic_studio_video_v2`, 5 credits, sound off; balance was 191 credits, kling3_0=7.5cr, seedance=17.5cr). Production `HiggsfieldVideoGenEngine` (`videogen:higgsfield`) targets the platform REST API (docs.higgsfield.ai): `POST /{model}` `{image_url(data URI), prompt, duration}` w/ `Authorization: Key key:secret` → poll `GET /requests/{id}/status` (queued|in_progress|completed|failed|nsfw) → download `video.url` to `workDir/clips/`. Concurrency 3, 2 attempts/shot, per-shot failure isolation (all-fail → error). Default model `higgsfield-ai/dop/standard` (override via `HIGGSFIELD_MODEL`). 5 unit tests w/ injected fetch. Server swaps it in when `HIGGSFIELD_API_KEY` (format `key:secret`) is in `.env`. VideoGen input widened to `{shots, assets}` (engine needs source images). **REST path now verified live (2026-07)** — see the Higgsfield-integration note below; the original data-URI image assumption was wrong and has been fixed to a CDN upload. Submit endpoint since migrated to v2 for motion strength (Phase 9a).
 
 ### Higgsfield integration — verified & gotchas (2026-07)
 - **Auth** `Authorization: Key <keyId>:<secret>` — the dashboard (cloud.higgsfield.ai/api-keys) issues a Key ID + Secret; join with a colon in `HIGGSFIELD_API_KEY`. Confirmed working (a bad image got 422 on the body, not 401).
+- **v2 endpoint (current path, probed + verified live 2026-07):**
+  `POST /v1/image2video/dop` `{ params: { prompt, input_images: [{type:'image_url',
+  image_url}], model: 'dop-turbo'|'dop-lite'|'dop-preview' (default dop-turbo),
+  motions: [{ id: <UUID>, strength: 0..1 }], seed?, enhance_prompt } }` → returns a
+  job-set `{ id, jobs: [...] }`. **The legacy `GET /requests/{id}/status` route accepts
+  the v2 id** (same `{status, video.url}` shape), so polling/download are unchanged.
+  There is **no duration param** (clips are ~5s, matching `clipDurationSec`). Motion
+  catalog: `GET /v1/motions` (121 presets, stable UUIDs — mapped from our motionPreset
+  names in `MOTION_IDS`, engine-videogen/higgsfield.ts). Unknown/legacy model values are
+  normalized to `dop-turbo`. Schema was discovered by probing FastAPI 422 validation
+  errors — empty/wrong-typed bodies enumerate fields; useful trick for their other
+  endpoints. dop-turbo prototype clip: 1280x720@30, ~5 min wall.
 - **Image input is NOT a data URI.** The platform rejects data-URI `image_url` with **HTTP 422 `url_too_long`** (2083-char cap). Real flow (from the official SDK, `npm pack higgsfield-client`): `POST /files/generate-upload-url {content_type}` → `{upload_url, public_url}`, then `PUT` raw bytes to `upload_url` (presigned; only `Content-Type` header), then submit `public_url` as `image_url`. Implemented as `uploadImage()` in `higgsfield.ts`.
 - **Latency & retry (fixed):** `dop/standard` ≈ a few min/clip, occasionally ~16 min under load. Default `maxPollMs` is 20 min. `generateShot` splits retry into two phases: obtaining a request_id (upload + submit) is retried (a failure there predates any billable job — e.g. a transient CDN 502), but poll + download is **never** retried, so a slow clip is never resubmitted/double-billed. So the default `maxAttempts: 2` is credit-safe.
 - **Fidelity (`enhance_prompt: false`):** the submit body disables the platform prompt-enhancer to curb invented detail (see the "Fidelity" section). Verified accepted by the DoP endpoint.
@@ -245,11 +280,21 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
   neutral non-directional moves, hard `FIDELITY_CONSTRAINT`) and `enhance_prompt: false` on
   the Higgsfield submit. A guaranteed-faithful Ken Burns engine was trialed as default but
   **removed — quality was unacceptable**; Higgsfield (hardened) stays the product path.
-- [ ] **Phase 9** — (a) further fidelity levers for the generative path: migrate to the SDK
-  v2 endpoint (`/v1/image2video/dop`) to set a low motion `strength` and guarantee
-  `enhance_prompt` is honored; optional automated frame-validation (Claude checks each clip
-  vs its source, regenerate/skip on drift). (b) `upscale_video` (key funded — unblocked).
-  (c) beat-aware pacing + music (no licensed assets yet). (d) Tauri desktop packaging.
+- [x] **Phase 9a — fidelity levers (2026-07)** — both levers landed. (1) VideoGen migrated
+  to the v2 endpoint (`POST /v1/image2video/dop`): motion presets mapped to catalog UUIDs
+  (`MOTION_IDS`), **motion strength default 0.3** (`HIGGSFIELD_MOTION_STRENGTH`),
+  schema-validated `enhance_prompt:false`, legacy status route reused for polling (v2 ids
+  accepted), legacy model names normalized to `dop-turbo`. Prototype
+  (`scripts/prototype-dop-v2.ts`, clip in `projects/prototype/`) verified low strength
+  keeps the previously-hallucinating living-room shot faithful. (2) New
+  **`@rev/engine-fidelity`** audit stage (see the Fidelity section): Claude frame audit,
+  drift ⇒ per-shot 'failed', fail-open, `fidelityChecked` resume semantics; wired in
+  orchestrator (`PipelineEngines.fidelity`, inside the videogen checkpoint), server
+  (key-gated), health + UI header. 4 new tests (45 total); live-audit of the prototype
+  clip correctly flagged its invented hearth fixture.
+- [ ] **Phase 9b+** — (a) measure fidelity-audit false-positive rate on a full real run.
+  (b) `upscale_video` (key funded — unblocked). (c) beat-aware pacing + music (no licensed
+  assets yet). (d) Tauri desktop packaging.
 
 ## Key decisions (locked for MVP)
 

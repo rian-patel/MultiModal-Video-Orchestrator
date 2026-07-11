@@ -68,6 +68,10 @@ export interface Shot {
   higgsfieldJobId?: string;
   clipPath?: string;
   status: ShotStatus;
+  /** True once the clip passed the fidelity audit (skips re-audits on resume).
+   * A drifted clip is set to 'failed' instead and left unflagged, so its
+   * regenerated replacement gets audited fresh. */
+  fidelityChecked?: boolean;
 }
 
 export interface Project {

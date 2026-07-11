@@ -74,5 +74,6 @@ export interface HealthData {
   engines: {
     vision: 'claude' | 'mock';
     videogen: 'higgsfield' | 'mock';
+    fidelity: 'claude' | 'mock';
   };
 }

@@ -103,7 +103,7 @@ export default function App() {
   const engineLine = health
     ? `analysis: ${health.engines.vision === 'claude' ? 'Claude' : 'mock'} · clips: ${
         health.engines.videogen === 'higgsfield' ? 'Higgsfield' : 'mock'
-      }`
+      } · fidelity: ${health.engines.fidelity === 'claude' ? 'Claude' : 'off'}`
     : null;
 
   return (

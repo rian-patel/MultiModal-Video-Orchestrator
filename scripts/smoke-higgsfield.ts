@@ -1,7 +1,8 @@
 // One-clip smoke test for the real Higgsfield platform API. Spends ~1 clip of
-// credits. Validates the whole real path end-to-end: auth header, submit,
-// data-URI image input, status polling, and download — before committing to a
-// full multi-clip run. Usage: tsx scripts/smoke-higgsfield.ts [imagePath]
+// credits. Validates the whole real path end-to-end: auth header, CDN image
+// upload, v2 submit (motion strength + enhance_prompt off), status polling,
+// and download — before committing to a full multi-clip run.
+// Usage: tsx scripts/smoke-higgsfield.ts [imagePath]
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createLogger, defaultConfig } from '@rev/core';
@@ -53,7 +54,7 @@ async function main() {
     throw new Error('HIGGSFIELD_API_KEY not in env — run via a shell that loaded .env');
   }
   console.log(`\nSmoke test: 1 clip from ${imgPath}`);
-  console.log(`Model: ${process.env.HIGGSFIELD_MODEL ?? 'higgsfield-ai/dop/standard'} (engine default)\n`);
+  console.log(`Model: ${process.env.HIGGSFIELD_MODEL ?? 'dop-turbo'}, motion strength ${process.env.HIGGSFIELD_MOTION_STRENGTH ?? '0.3'} (engine defaults)\n`);
 
   const t0 = Date.now();
   const engine = new HiggsfieldVideoGenEngine();

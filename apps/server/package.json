@@ -13,6 +13,7 @@
     "@rev/engine-upload": "*",
     "@rev/engine-vision": "*",
     "@rev/engine-videogen": "*",
+    "@rev/engine-fidelity": "*",
     "@rev/orchestrator": "*",
     "fastify": "^5.0.0"
   }

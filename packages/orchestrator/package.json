@@ -13,6 +13,7 @@
     "@rev/engine-storyboard": "*",
     "@rev/engine-prompt": "*",
     "@rev/engine-videogen": "*",
+    "@rev/engine-fidelity": "*",
     "@rev/engine-render": "*"
   }
 }
