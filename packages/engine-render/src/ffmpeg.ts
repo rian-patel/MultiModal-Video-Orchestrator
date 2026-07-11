@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import ffmpegPath from 'ffmpeg-static';
 import type { Engine, EngineContext, Shot } from '@rev/core';
+import { CARD_SEC, renderEndCard, renderTitleCard, renderWatermark } from './cards';
 import type { RenderInput, RenderResult } from './types';
 
 const FPS = 30;
@@ -93,10 +94,21 @@ export async function probeDurationSec(file: string): Promise<number> {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
+const ENCODE_ARGS = [
+  '-c:v', 'libx264',
+  '-preset', 'medium',
+  '-crf', '19',
+  '-pix_fmt', 'yuv420p',
+  '-movflags', '+faststart',
+] as const;
+
 /**
  * The real Render Engine: trims each clip to its shot duration, chains
  * crossfades, and encodes H.264 at config.resolution. Failed shots are
- * skipped — the cut uses whatever clips exist.
+ * skipped — the cut uses whatever clips exist. With `branding`, a title card
+ * (address) and end card (agent/contact/logo) join the crossfade chain and a
+ * corner logo watermark rides over the tour segment. A 9:16 blur-pad social
+ * cut is always derived from the finished master (deterministic + free).
  */
 export class FfmpegRenderEngine implements Engine<RenderInput, RenderResult> {
   readonly name = 'render:ffmpeg';
@@ -110,11 +122,49 @@ export class FfmpegRenderEngine implements Engine<RenderInput, RenderResult> {
       throw new Error('No rendered clips available — every shot failed generation.');
     }
 
-    const durations = usable.map((s) => s.durationSec);
+    const outDir = dirname(input.outputPath);
+    await mkdir(outDir, { recursive: true });
+
+    // Branded cards become extra looped-image inputs in the same xfade chain.
+    const branding = input.branding ?? {};
+    const titlePng = await renderTitleCard(branding, resolution.width, resolution.height);
+    const endPng = await renderEndCard(branding, resolution.width, resolution.height);
+    const titlePath = titlePng ? join(outDir, 'title-card.png') : null;
+    const endPath = endPng ? join(outDir, 'end-card.png') : null;
+    if (titlePng && titlePath) await writeFile(titlePath, titlePng);
+    if (endPng && endPath) await writeFile(endPath, endPng);
+
+    const cardInput = (path: string) => ['-loop', '1', '-t', String(CARD_SEC + 1), '-i', path];
+    const inputs = [
+      ...(titlePath ? cardInput(titlePath) : []),
+      ...usable.flatMap((s) => ['-i', s.clipPath as string]),
+      ...(endPath ? cardInput(endPath) : []),
+    ];
+    const durations = [
+      ...(titlePath ? [CARD_SEC] : []),
+      ...usable.map((s) => s.durationSec),
+      ...(endPath ? [CARD_SEC] : []),
+    ];
     const graph = buildXfadeGraph(durations, crossfadeSec, resolution.width, resolution.height);
 
-    await mkdir(dirname(input.outputPath), { recursive: true });
-    const planPath = `${dirname(input.outputPath)}/render-plan.json`;
+    // Corner watermark over the tour segment only (cards carry their own logo).
+    let filter = graph.filter;
+    let outLabel = graph.outLabel;
+    if (branding.logoPath) {
+      const wmPath = join(outDir, 'watermark.png');
+      await writeFile(wmPath, await renderWatermark(branding.logoPath, resolution.width));
+      const wmIndex = inputs.filter((a) => a === '-i').length;
+      inputs.push('-i', wmPath);
+      const from = titlePath ? CARD_SEC - crossfadeSec : 0;
+      const to = graph.totalDurationSec - (endPath ? CARD_SEC - crossfadeSec : 0);
+      const margin = Math.round(resolution.width * 0.025);
+      filter +=
+        `;[${wmIndex}:v]format=rgba,colorchannelmixer=aa=0.55[wm];` +
+        `[${graph.outLabel}][wm]overlay=W-w-${margin}:H-h-${margin}:enable='between(t,${from.toFixed(3)},${to.toFixed(3)})'[outw]`;
+      outLabel = 'outw';
+    }
+
+    const planPath = `${outDir}/render-plan.json`;
     await writeFile(
       planPath,
       JSON.stringify(
@@ -124,6 +174,8 @@ export class FfmpegRenderEngine implements Engine<RenderInput, RenderResult> {
           crossfadeSec,
           fps: FPS,
           totalDurationSec: graph.totalDurationSec,
+          cards: { title: titlePath, end: endPath, cardSec: titlePath || endPath ? CARD_SEC : 0 },
+          watermark: Boolean(branding.logoPath),
           clips: usable.map((s) => ({
             order: s.order,
             room: s.roomType,
@@ -139,14 +191,10 @@ export class FfmpegRenderEngine implements Engine<RenderInput, RenderResult> {
     );
 
     const args = [
-      ...usable.flatMap((s) => ['-i', s.clipPath as string]),
-      '-filter_complex', graph.filter,
-      '-map', `[${graph.outLabel}]`,
-      '-c:v', 'libx264',
-      '-preset', 'medium',
-      '-crf', '19',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
+      ...inputs,
+      '-filter_complex', filter,
+      '-map', `[${outLabel}]`,
+      ...ENCODE_ARGS,
       '-y', input.outputPath,
     ];
 
@@ -155,12 +203,27 @@ export class FfmpegRenderEngine implements Engine<RenderInput, RenderResult> {
       const m = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
       if (m) {
         const t = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
-        const pct = Math.min(99, Math.round((t / graph.totalDurationSec) * 100));
+        const pct = Math.min(94, Math.round((t / graph.totalDurationSec) * 95));
         ctx.progress(pct, `Encoding ${Math.round(t)}s / ${graph.totalDurationSec}s`);
       }
     });
 
-    ctx.progress(100, `Rendered ${usable.length} clips -> ${graph.totalDurationSec}s MP4`);
-    return { outputPath: input.outputPath, planPath, totalDurationSec: graph.totalDurationSec };
+    // 9:16 social cut: the master centered over a blurred, darkened fill.
+    ctx.progress(95, 'Deriving 9:16 social cut');
+    const vertical = { width: resolution.height, height: resolution.width };
+    const verticalPath = input.outputPath.replace(/\.mp4$/i, '') + '-vertical.mp4';
+    await runFfmpeg([
+      '-i', input.outputPath,
+      '-filter_complex',
+      `[0:v]split=2[bg][fg];` +
+        `[bg]scale=${vertical.width}:${vertical.height}:force_original_aspect_ratio=increase,` +
+        `crop=${vertical.width}:${vertical.height},gblur=sigma=24,eq=brightness=-0.08[b];` +
+        `[fg]scale=${vertical.width}:-2[f];[b][f]overlay=(W-w)/2:(H-h)/2`,
+      ...ENCODE_ARGS,
+      '-y', verticalPath,
+    ]);
+
+    ctx.progress(100, `Rendered ${usable.length} clips -> ${graph.totalDurationSec}s MP4 (+9:16 cut)`);
+    return { outputPath: input.outputPath, planPath, totalDurationSec: graph.totalDurationSec, verticalPath };
   }
 }

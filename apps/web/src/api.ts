@@ -36,31 +36,56 @@ async function toRunId(res: Response): Promise<string> {
   return runId;
 }
 
+/** Branding as the UI collects it (logo as a File; text fields optional). */
+export interface BrandingInput {
+  address?: string;
+  agentName?: string;
+  phone?: string;
+  email?: string;
+  logo?: File | null;
+}
+
 /**
  * Start a run. With files: multipart upload of the real photo bytes (the
  * server routes them through the real Upload Engine). Without: JSON demo mode
  * (mock engines, built-in demo set). With `review`, the run pauses at the
  * storyboard checkpoint (before any paid clip generation) and emits a
- * `review` event instead of running through.
+ * `review` event instead of running through. Branding fields ride along and
+ * become title/end cards + a logo watermark in the final render.
  */
 export async function startRun(
   targetDurationSec: number,
   files?: File[],
   review = false,
+  branding?: BrandingInput,
 ): Promise<string> {
+  const text = {
+    address: branding?.address?.trim(),
+    agentName: branding?.agentName?.trim(),
+    phone: branding?.phone?.trim(),
+    email: branding?.email?.trim(),
+  };
   let res: Response;
   if (files && files.length > 0) {
     const form = new FormData();
     // Field order matters for streaming parsers: scalar fields first.
     form.append('targetDurationSec', String(targetDurationSec));
     if (review) form.append('review', '1');
+    for (const [k, v] of Object.entries(text)) if (v) form.append(k, v);
+    if (branding?.logo) form.append('logo', branding.logo, branding.logo.name);
     for (const f of files) form.append('photos', f, f.name);
     res = await fetch('/api/runs', { method: 'POST', body: form });
   } else {
+    const hasText = Object.values(text).some(Boolean);
     res = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ targetDurationSec, review }),
+      body: JSON.stringify({
+        targetDurationSec,
+        review,
+        // JSON demo mode carries text branding only (no logo bytes).
+        branding: hasText ? text : undefined,
+      }),
     });
   }
   return toRunId(res);

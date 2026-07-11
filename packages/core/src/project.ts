@@ -74,6 +74,23 @@ export interface Shot {
   fidelityChecked?: boolean;
 }
 
+/**
+ * Optional agent/property branding, rendered by the Render Engine into a
+ * title card (address), an end card (agent + contact + logo) and a corner
+ * logo watermark over the tour. All fields optional — cards are only
+ * emitted when they have content.
+ */
+export interface Branding {
+  /** Property address — the title card headline. */
+  address?: string;
+  agentName?: string;
+  phone?: string;
+  email?: string;
+  /** Agent logo image. On a persisted Project this points inside the
+   * project workDir (the orchestrator copies the original at run start). */
+  logoPath?: string;
+}
+
 export interface Project {
   id: string;
   createdAt: string;
@@ -82,7 +99,10 @@ export interface Project {
   assets: Asset[];
   vision: VisionResult[];
   shots: Shot[];
+  branding?: Branding;
   outputPath?: string;
+  /** 9:16 social cut, derived from the master after render. */
+  verticalPath?: string;
   /** Why the last run stopped; cleared when a resume starts. */
   lastError?: string;
 }

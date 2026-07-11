@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import ffmpegPath from 'ffmpeg-static';
+import sharp from 'sharp';
 import { defaultConfig } from '@rev/core';
 import type { EngineContext, Shot } from '@rev/core';
 import { buildXfadeGraph, FfmpegRenderEngine, probeDurationSec } from './ffmpeg';
@@ -101,4 +103,68 @@ test('no usable clips rejects', async () => {
     new FfmpegRenderEngine().process({ shots, outputPath: join(dir, 'x.mp4') }, makeCtx(dir)),
     /every shot failed/,
   );
+});
+
+test('branding adds title/end cards + watermark; a 9:16 vertical cut is derived', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'rev-render-'));
+  const clips = [join(dir, 'c0.mp4'), join(dir, 'c1.mp4')];
+  await Promise.all(clips.map((p) => makeClip(p, 2)));
+  const logoPath = join(dir, 'logo.png');
+  await writeFile(
+    logoPath,
+    await sharp({
+      create: { width: 300, height: 150, channels: 4, background: { r: 220, g: 40, b: 40, alpha: 1 } },
+    })
+      .png()
+      .toBuffer(),
+  );
+
+  const shots = clips.map((p, i) => shot(i, p, 1.5));
+  const out = join(dir, 'tour.mp4');
+  const result = await new FfmpegRenderEngine().process(
+    {
+      shots,
+      outputPath: out,
+      branding: { address: '128 Maple Grove Ln', agentName: 'Jane Smith', phone: '555-0100', logoPath },
+    },
+    makeCtx(dir),
+  );
+
+  // [title 3s, 1.5s, 1.5s, end 3s] with 3 crossfades of 0.5 -> 7.5s total.
+  assert.equal(result.totalDurationSec, 7.5);
+  const probed = await probeDurationSec(out);
+  assert.ok(Math.abs(probed - 7.5) < 0.3, `probed ${probed}s, expected ~7.5s`);
+  assert.ok(existsSync(join(dir, 'title-card.png')), 'title card written');
+  assert.ok(existsSync(join(dir, 'end-card.png')), 'end card written');
+  assert.ok(existsSync(join(dir, 'watermark.png')), 'watermark written');
+
+  // Vertical cut: swapped dimensions (SMALL is 320x180 -> 180x320), same length.
+  assert.ok(result.verticalPath && existsSync(result.verticalPath), 'vertical cut exists');
+  assert.match(result.verticalPath as string, /tour-vertical\.mp4$/);
+  const vProbe = await probeDurationSec(result.verticalPath as string);
+  assert.ok(Math.abs(vProbe - 7.5) < 0.3, `vertical probed ${vProbe}s`);
+  let info = '';
+  await new Promise<void>((resolve) => {
+    const proc = spawn(ffmpegPath as string, ['-i', result.verticalPath as string], { windowsHide: true });
+    proc.stderr.on('data', (c: Buffer) => (info += c.toString()));
+    proc.on('close', () => resolve());
+  });
+  assert.match(info, /180x320/, 'vertical stream is 9:16');
+});
+
+test('no branding renders no cards, but the vertical cut is still produced', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'rev-render-'));
+  const clip = join(dir, 'c0.mp4');
+  await makeClip(clip, 2);
+
+  const out = join(dir, 'tour.mp4');
+  const result = await new FfmpegRenderEngine().process(
+    { shots: [shot(0, clip, 1.5)], outputPath: out },
+    makeCtx(dir),
+  );
+
+  assert.equal(result.totalDurationSec, 1.5);
+  assert.ok(!existsSync(join(dir, 'title-card.png')), 'no title card without branding');
+  assert.ok(!existsSync(join(dir, 'end-card.png')), 'no end card without branding');
+  assert.ok(result.verticalPath && existsSync(result.verticalPath), 'vertical always derived');
 });

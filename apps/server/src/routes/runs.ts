@@ -5,7 +5,7 @@ import { basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { FastifyInstance } from 'fastify';
 import { defaultConfig, newId } from '@rev/core';
-import type { Project, ReviewEventData, ReviewShot, Shot } from '@rev/core';
+import type { Branding, Project, ReviewEventData, ReviewShot, Shot } from '@rev/core';
 import {
   loadProject,
   nextStage,
@@ -35,7 +35,12 @@ interface StartRunJsonBody {
   sourceNames?: string[];
   /** Pause at the storyboard review checkpoint instead of animating straight through. */
   review?: boolean;
+  /** Agent/property branding (text fields only in JSON mode — no logo). */
+  branding?: { address?: string; agentName?: string; phone?: string; email?: string };
 }
+
+/** Multipart text fields that map straight onto Branding. */
+const BRANDING_FIELDS = ['address', 'agentName', 'phone', 'email'] as const;
 
 const DEMO_SOURCES = Array.from({ length: 14 }, (_, i) => `DEMO_${String(i + 1).padStart(2, '0')}.jpg`);
 
@@ -123,9 +128,17 @@ export function registerRunRoutes(
       let target: TourLength | null = null;
       let review = false;
       const sources: SourceFile[] = [];
+      const branding: Branding = {};
       try {
         for await (const part of req.parts()) {
           if (part.type === 'file') {
+            if (part.fieldname === 'logo') {
+              const ext = (part.filename?.match(/\.(png|jpe?g|webp)$/i)?.[0] ?? '.png').toLowerCase();
+              const tmpPath = join(uploadDir, `logo${ext}`);
+              await pipeline(part.file, createWriteStream(tmpPath));
+              branding.logoPath = tmpPath;
+              continue;
+            }
             if (part.fieldname !== 'photos') {
               part.file.resume(); // drain unknown file fields
               continue;
@@ -139,6 +152,9 @@ export function registerRunRoutes(
             target = parseTarget(part.value);
           } else if (part.fieldname === 'review') {
             review = ['1', 'true', 'on'].includes(String(part.value).toLowerCase());
+          } else if ((BRANDING_FIELDS as readonly string[]).includes(part.fieldname)) {
+            const v = String(part.value).trim();
+            if (v) branding[part.fieldname as (typeof BRANDING_FIELDS)[number]] = v;
           }
         }
       } catch (err) {
@@ -168,6 +184,7 @@ export function registerRunRoutes(
             targetDurationSec: target,
             engines: { upload: new LocalUploadEngine(), ...keyedEngines() },
             config,
+            branding: Object.keys(branding).length > 0 ? branding : undefined,
             stopAfter: review ? 'prompted' : undefined,
             onProject: (projectId) => { run.projectId = projectId; },
             onProgress: (pct, stage, msg) =>
@@ -195,6 +212,7 @@ export function registerRunRoutes(
         request,
         targetDurationSec: target,
         config,
+        branding: body.branding,
         stopAfter: body.review ? 'prompted' : undefined,
         onProject: (projectId) => { run.projectId = projectId; },
         onProgress: (pct, stage, msg) =>
@@ -347,25 +365,33 @@ export function registerRunRoutes(
     return reply.send(createReadStream(asset.thumbPath));
   });
 
-  // Stream the finished MP4. Supports Range requests (required for <video>
+  // Stream a finished MP4 (default: the 16:9 master; `?variant=vertical` =
+  // the 9:16 social cut). Supports Range requests (required for <video>
   // seeking); `?download` adds a content-disposition attachment.
   app.get('/api/projects/:id/video', async (req, reply) => {
     const { id } = req.params as { id: string };
     const project = await readProject(projectsDir, id);
     if (!project) return reply.code(404).send({ error: 'project not found' });
-    if (!project.outputPath) {
-      return reply.code(409).send({ error: 'video not rendered yet' });
+    const { download, variant } = req.query as { download?: string; variant?: string };
+    if (variant !== undefined && variant !== 'vertical') {
+      return reply.code(400).send({ error: 'unknown variant — only "vertical" exists' });
     }
-    const info = await stat(project.outputPath).catch(() => null);
+    const filePath = variant === 'vertical' ? project.verticalPath : project.outputPath;
+    if (!filePath) {
+      return reply.code(409).send({
+        error: variant === 'vertical' ? 'no vertical cut for this project' : 'video not rendered yet',
+      });
+    }
+    const info = await stat(filePath).catch(() => null);
     if (!info) return reply.code(404).send({ error: 'video file is missing on disk' });
 
     reply.header('accept-ranges', 'bytes');
     reply.type('video/mp4');
-    const { download } = req.query as { download?: string };
     if (download !== undefined) {
+      const suffix = variant === 'vertical' ? '-vertical' : '';
       reply.header(
         'content-disposition',
-        `attachment; filename="tour-${project.targetDurationSec}s.mp4"`,
+        `attachment; filename="tour-${project.targetDurationSec}s${suffix}.mp4"`,
       );
     }
 
@@ -378,10 +404,10 @@ export function registerRunRoutes(
         .code(206)
         .header('content-range', `bytes ${range.start}-${range.end}/${info.size}`)
         .header('content-length', range.end - range.start + 1);
-      return reply.send(createReadStream(project.outputPath, { start: range.start, end: range.end }));
+      return reply.send(createReadStream(filePath, { start: range.start, end: range.end }));
     }
     reply.header('content-length', info.size);
-    return reply.send(createReadStream(project.outputPath));
+    return reply.send(createReadStream(filePath));
   });
 }
 
@@ -457,6 +483,9 @@ async function trackRun(
       data: {
         projectId: project.id,
         videoUrl: `/api/projects/${project.id}/video`,
+        verticalUrl: render.verticalPath
+          ? `/api/projects/${project.id}/video?variant=vertical`
+          : undefined,
         outputPath: render.outputPath,
         totalDurationSec: render.totalDurationSec,
         shotCount: done.length,

@@ -5,7 +5,8 @@ import type {
   ProgressEventData,
   ReviewEventData,
 } from '@rev/core';
-import { checkHealth, patchStoryboard, resumeRun, startRun, watchRun } from './api';
+import { checkHealth, patchStoryboard, resumeRun, startRun, watchRun, type BrandingInput } from './api';
+import { BrandingSection } from './components/BrandingSection';
 import { Dropzone } from './components/Dropzone';
 import { LengthSelector, type TourLength } from './components/LengthSelector';
 import { ProgressBar } from './components/ProgressBar';
@@ -18,6 +19,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthData | null | undefined>(undefined);
   const [files, setFiles] = useState<File[]>([]);
   const [length, setLength] = useState<TourLength>(45);
+  const [branding, setBranding] = useState<BrandingInput>({});
   const [reviewFirst, setReviewFirst] = useState(true);
   const [phase, setPhase] = useState<Phase>('idle');
   const [progress, setProgress] = useState<ProgressEventData | null>(null);
@@ -63,7 +65,7 @@ export default function App() {
     setError(null);
     setProjectId(null);
     try {
-      follow(await startRun(length, usingDemo ? undefined : files, reviewFirst));
+      follow(await startRun(length, usingDemo ? undefined : files, reviewFirst, branding));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('error');
@@ -135,6 +137,7 @@ export default function App() {
         <main className="space-y-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
           <Dropzone files={files} onChange={setFiles} disabled={busy} />
           <LengthSelector value={length} onChange={setLength} disabled={busy} />
+          <BrandingSection value={branding} onChange={setBranding} disabled={busy} />
 
           <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
             <input

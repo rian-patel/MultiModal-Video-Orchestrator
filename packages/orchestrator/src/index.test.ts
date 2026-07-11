@@ -268,3 +268,39 @@ test('unresumable states are rejected with a clear error', async () => {
   // unknown project id
   await assert.rejects(resumePipeline({ projectId: 'proj_nope', config }));
 });
+
+test('branding is sanitized, the logo copied into the project, and passed to render', async () => {
+  const config = await tempConfig();
+  const logoSrc = join(config.projectsDir, 'ephemeral-logo.png');
+  await writeFile(logoSrc, 'png-bytes');
+
+  const renderInputs: RenderInput[] = [];
+  const render: Engine<RenderInput, RenderResult> = {
+    name: 'render:capture',
+    async process(input) {
+      renderInputs.push(input);
+      await writeFile(input.outputPath, 'mp4');
+      return { outputPath: input.outputPath, planPath: '', totalDurationSec: 42, verticalPath: `${input.outputPath}.v` };
+    },
+  };
+
+  const { project: done } = await runPipeline({
+    request: REQUEST,
+    targetDurationSec: 30,
+    config,
+    engines: { videogen: stubVideogen(), render },
+    branding: { address: '  128 Maple Grove Ln  ', agentName: '', phone: '555-0100', logoPath: logoSrc },
+  });
+
+  const saved = await loadProject(join(config.projectsDir, done.id));
+  assert.equal(saved.branding?.address, '128 Maple Grove Ln', 'trimmed');
+  assert.equal(saved.branding?.agentName, undefined, 'empty fields dropped');
+  assert.equal(saved.branding?.phone, '555-0100');
+  assert.ok(
+    saved.branding?.logoPath?.includes(done.id),
+    'logo now lives inside the project workDir (survives temp cleanup)',
+  );
+  assert.ok(existsSync(saved.branding?.logoPath as string), 'copied logo exists');
+  assert.equal(renderInputs[0].branding?.address, '128 Maple Grove Ln', 'render engine got the branding');
+  assert.equal(saved.verticalPath, `${saved.outputPath}.v`, 'vertical path persisted');
+});

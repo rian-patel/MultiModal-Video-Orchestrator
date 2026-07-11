@@ -48,7 +48,7 @@ Upload → Vision → Storyboard → Prompt → VideoGen → Fidelity → Render
 | **Prompt** | `{shots,vision}` → `Shot[]` | vision-move + room-variant composer (see Phase 4 notes) | LLM prompts |
 | **VideoGen** | `{shots,assets}` → `Shot[]` | Higgsfield (submit/poll/download) | Runway/Kling/Luma |
 | **Fidelity** | `{shots,assets}` → `Shot[]` | Claude audits clip frames vs source photo; drift ⇒ shot 'failed' | frame-diff heuristics |
-| **Render** | `{shots,outputPath}` → `RenderResult` | FFmpeg | Remotion |
+| **Render** | `{shots,outputPath,branding?}` → `RenderResult` | FFmpeg (+cards/watermark/9:16) | Remotion |
 
 (Fidelity runs *inside* the videogen stage checkpoint — no new `ProjectStage`; a
 dropped clip is a per-shot 'failed', which render skips and resume regenerates.)
@@ -93,8 +93,9 @@ apps/
                       routes/health.ts, routes/runs.ts, paths.ts = repo-root resolution)
   web/               @rev/web — React 19 + Vite + Tailwind v4 (port 5173, /api proxied
                      to 3001): App.tsx, api.ts (SSE client), components/{Dropzone,
-                     LengthSelector, ProgressBar, ResultCard (video preview + download),
-                     ReviewScreen (storyboard review: reorder/remove/approve)}
+                     LengthSelector, BrandingSection (collapsible; agent identity
+                     persisted in localStorage), ProgressBar, ResultCard (video preview
+                     + master/vertical downloads), ReviewScreen (reorder/remove/approve)}
 scripts/demo.ts      runs the full pipeline on fake data (no server needed)
 projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (gitignored)
 ```
@@ -105,16 +106,21 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
   `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
   SSE `review` instead of animating straight through — no clip spend until approval):
   - `multipart/form-data`: real photos. Fields: `targetDurationSec` (30|45|60) +
-    `photos` file parts (10–40, ≤30 MB each). Streamed to `%TMP%/rev-uploads/<id>/`,
-    run through the real `LocalUploadEngine` (engine override), temp dir removed
-    in `trackRun`'s finally. → `202 { runId, photoCount }`. Bad count/duration → 400.
-  - `application/json` `{ targetDurationSec }`: demo mode — built-in 14-name set
-    through the mock Upload Engine. → `202 { runId }`.
+    `photos` file parts (10–40, ≤30 MB each) + optional branding text fields
+    (`address`, `agentName`, `phone`, `email`) and a `logo` file part. Streamed to
+    `%TMP%/rev-uploads/<id>/`, run through the real `LocalUploadEngine` (engine
+    override), temp dir removed in `trackRun`'s finally (the orchestrator copies the
+    logo into `workDir/branding/` first, so resumes never depend on the temp dir).
+    → `202 { runId, photoCount }`. Bad count/duration → 400.
+  - `application/json` `{ targetDurationSec, branding? }`: demo mode — built-in
+    14-name set through the mock Upload Engine (branding = text fields only).
+    → `202 { runId }`.
 - `GET  /api/runs/:id` → snapshot `{ id, status, projectId, lastEvent }` (projectId set as soon as the project exists, not only on success).
 - `GET  /api/runs/:id/events` → SSE. Event names: `progress`, `review`, `complete`,
   `run-error` (NOT `error` — that's reserved by EventSource). Replays buffered events
   to late subscribers, so reconnects recover the full history. `complete` carries
-  `videoUrl` + shot count/rooms of **successful** shots only; `review` carries
+  `videoUrl` (+ `verticalUrl` when a 9:16 cut exists) + shot count/rooms of
+  **successful** shots only; `review` carries
   `ReviewEventData` (shots w/ prompts+thumbUrls, benched photos, pacing config) and is
   terminal for that run's stream; `run-error` carries `projectId?` (what enables Resume
   in the UI). The web client also handles EventSource giving up (server restarted
@@ -128,9 +134,11 @@ projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (
 - `POST /api/projects/:id/resume` → `202 { runId, projectId, resumeFrom }` — re-runs a
   persisted project from its last checkpoint (semantics below). 404 unknown project,
   409 if already complete or upload never finished. Same SSE contract as a normal run.
-- `GET  /api/projects/:id/video` → streams the finished MP4. Single-range `Range:`
-  support (206/416 — required for `<video>` seeking); `?download` adds
-  `content-disposition: attachment; filename="tour-<len>s.mp4"`. 409 before render.
+- `GET  /api/projects/:id/video` → streams the finished MP4 (default: 16:9 master;
+  `?variant=vertical` = the 9:16 social cut, 409 if none, 400 for unknown variants).
+  Single-range `Range:` support (206/416 — required for `<video>` seeking);
+  `?download` adds `content-disposition: attachment;
+  filename="tour-<len>s[-vertical].mp4"`. 409 before render.
 
 ### Resume semantics (Phase 7, in `@rev/orchestrator`)
 `project.stage` is a **checkpoint**: it only advances when that stage's output is on
@@ -292,9 +300,27 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
   orchestrator (`PipelineEngines.fidelity`, inside the videogen checkpoint), server
   (key-gated), health + UI header. 4 new tests (45 total); live-audit of the prototype
   clip correctly flagged its invented hearth fixture.
-- [ ] **Phase 9b+** — (a) measure fidelity-audit false-positive rate on a full real run.
-  (b) `upscale_video` (key funded — unblocked). (c) beat-aware pacing + music (no licensed
-  assets yet). (d) Tauri desktop packaging.
+- [x] **Phase 10 — branded deliverable + vertical (2026-07)** — turning the silent 16:9
+  clip into something an agent can post. (1) **Branding overlays**: optional `Branding`
+  on `Project` (address/agentName/phone/email/logoPath); Render composes a title card
+  (address headline) + end card (agent, phone·email, logo) as sharp SVG→PNG image
+  inputs in the same xfade chain (each `CARD_SEC`=3s, so a 30s tour ships as 34.5s),
+  plus a 55%-opacity corner logo watermark timeline-enabled over the tour segment only
+  (`packages/engine-render/src/cards.ts`; user text XML-escaped). Logo is copied into
+  `workDir/branding/` at run start (`adoptBranding`) so resume never depends on upload
+  temp dirs. UI: collapsible BrandingSection, agent identity kept in localStorage.
+  (2) **9:16 vertical** (`tour-vertical.mp4`): always derived from the finished master —
+  blur-pad (gblur=24 + slight darken) behind the centered 16:9 band; zero extra credits.
+  Served via `?variant=vertical`; second download button in ResultCard. (3) **Video
+  upscale: NOT integrable** — probed the platform API 2026-07 (`v1/upscale/video` and
+  every plausible route → "Model not found"); `upscale_video` exists only on the
+  consumer MCP subscription, not the API-key pool. Revisit if Higgsfield ships it.
+  8 new tests (53 total). Verified over HTTP: branded 30s demo → 34.5s master
+  (cards eyeballed correct) + 1080x1920 vertical, both stream w/ Range + download names.
+- [ ] **Phase 10b+** — (a) measure fidelity-audit false-positive rate on a full real run.
+  (b) beat-aware pacing + music — **user opted out of music for now** (revisit only if
+  asked; no licensed assets). (c) Tauri desktop packaging. (d) full real-photo run
+  through the browser UI (upload→review→generate→download) to shake out UX gaps.
 
 ## Key decisions (locked for MVP)
 

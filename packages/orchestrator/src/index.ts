@@ -1,5 +1,5 @@
-import { access } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, copyFile, mkdir } from 'node:fs/promises';
+import { extname, join } from 'node:path';
 import {
   createLogger,
   defaultConfig,
@@ -7,6 +7,7 @@ import {
 } from '@rev/core';
 import type {
   Asset,
+  Branding,
   Engine,
   EngineContext,
   PipelineConfig,
@@ -68,6 +69,10 @@ export interface RunOptions {
   /** Stop at the 'prompted' checkpoint (before any paid clip generation) so
    * the user can review/edit the storyboard; continue via resumePipeline. */
   stopAfter?: 'prompted';
+  /** Agent/property branding for the Render Engine. `logoPath` may point
+   * anywhere readable (e.g. an upload temp dir) — it is copied into the
+   * project workDir at run start, so resumes never depend on temp files. */
+  branding?: Branding;
 }
 
 export interface ResumeOptions {
@@ -124,6 +129,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   };
   const workDir = join(config.projectsDir, project.id);
   await ensureProjectDirs(workDir);
+  if (opts.branding) project.branding = await adoptBranding(opts.branding, workDir);
   await saveProject(workDir, project);
   opts.onProject?.(project.id);
   return executeFrom(project, workDir, 'upload', config, opts, opts.request);
@@ -246,10 +252,11 @@ async function executeFrom(
     await saveProject(workDir, project);
     const outputPath = join(workDir, 'output', 'tour.mp4');
     const render = await engines.render.process(
-      { shots: project.shots, outputPath },
+      { shots: project.shots, outputPath, branding: project.branding },
       ctxFor(5, 'render'),
     );
     project.outputPath = render.outputPath;
+    project.verticalPath = render.verticalPath;
     project.stage = 'complete';
     await saveProject(workDir, project);
 
@@ -306,6 +313,27 @@ async function generateClips(
     generated = todo.map((s) => ({ ...s, status: 'failed' as const }));
   }
   return [...keep, ...generated].sort((a, b) => a.order - b.order);
+}
+
+/**
+ * Sanitize incoming branding and make it durable: text fields trimmed and
+ * capped, the logo copied into workDir/branding so it outlives the caller's
+ * temp files. Returns undefined when nothing meaningful was provided.
+ */
+async function adoptBranding(input: Branding, workDir: string): Promise<Branding | undefined> {
+  const b: Branding = {};
+  for (const key of ['address', 'agentName', 'phone', 'email'] as const) {
+    const v = input[key]?.trim();
+    if (v) b[key] = v.slice(0, 120);
+  }
+  if (input.logoPath) {
+    const ext = extname(input.logoPath).toLowerCase() || '.png';
+    const dest = join(workDir, 'branding', `logo${ext}`);
+    await mkdir(join(workDir, 'branding'), { recursive: true });
+    await copyFile(input.logoPath, dest);
+    b.logoPath = dest;
+  }
+  return Object.keys(b).length > 0 ? b : undefined;
 }
 
 async function fileExists(path: string): Promise<boolean> {

@@ -7,11 +7,21 @@ import type { Project } from '@rev/core';
 import { buildApp } from '../app';
 import { parseByteRange } from './runs';
 
-async function makeCompletedProject(projectsDir: string, id: string, bytes: string): Promise<void> {
+async function makeCompletedProject(
+  projectsDir: string,
+  id: string,
+  bytes: string,
+  opts: { verticalBytes?: string } = {},
+): Promise<void> {
   const workDir = join(projectsDir, id);
   await mkdir(join(workDir, 'output'), { recursive: true });
   const outputPath = join(workDir, 'output', 'tour.mp4');
   await writeFile(outputPath, bytes);
+  let verticalPath: string | undefined;
+  if (opts.verticalBytes !== undefined) {
+    verticalPath = join(workDir, 'output', 'tour-vertical.mp4');
+    await writeFile(verticalPath, opts.verticalBytes);
+  }
   const project: Project = {
     id,
     createdAt: new Date().toISOString(),
@@ -21,6 +31,7 @@ async function makeCompletedProject(projectsDir: string, id: string, bytes: stri
     vision: [],
     shots: [],
     outputPath,
+    verticalPath,
   };
   await writeFile(join(workDir, 'project.json'), JSON.stringify(project), 'utf8');
 }
@@ -69,6 +80,34 @@ test('video route streams, honors Range, and labels downloads', async () => {
   res = await app.inject({ url: '/api/projects/proj_video/video?download' });
   assert.equal(res.statusCode, 200);
   assert.match(String(res.headers['content-disposition']), /attachment; filename="tour-45s\.mp4"/);
+
+  await app.close();
+});
+
+test('vertical variant streams its own file with its own filename', async () => {
+  const projectsDir = await mkdtemp(join(tmpdir(), 'rev-server-'));
+  const app = await buildApp({ projectsDir });
+  await makeCompletedProject(projectsDir, 'proj_vert', 'MASTER', { verticalBytes: 'VERTICAL' });
+  await makeCompletedProject(projectsDir, 'proj_novert', 'MASTER');
+
+  let res = await app.inject({ url: '/api/projects/proj_vert/video?variant=vertical' });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.rawPayload.toString(), 'VERTICAL');
+
+  res = await app.inject({ url: '/api/projects/proj_vert/video' });
+  assert.equal(res.rawPayload.toString(), 'MASTER', 'default stays the 16:9 master');
+
+  res = await app.inject({ url: '/api/projects/proj_vert/video?variant=vertical&download' });
+  assert.match(
+    String(res.headers['content-disposition']),
+    /attachment; filename="tour-45s-vertical\.mp4"/,
+  );
+
+  res = await app.inject({ url: '/api/projects/proj_novert/video?variant=vertical' });
+  assert.equal(res.statusCode, 409, 'no vertical file for this project');
+
+  res = await app.inject({ url: '/api/projects/proj_vert/video?variant=diagonal' });
+  assert.equal(res.statusCode, 400, 'unknown variants rejected');
 
   await app.close();
 });

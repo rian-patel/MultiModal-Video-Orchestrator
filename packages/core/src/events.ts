@@ -18,6 +18,8 @@ export interface CompleteEventData {
   projectId: string;
   /** Server URL that streams the finished MP4 (append `?download` for an attachment). */
   videoUrl: string;
+  /** Server URL of the 9:16 social cut, when one was rendered. */
+  verticalUrl?: string;
   outputPath: string;
   totalDurationSec: number;
   shotCount: number;
