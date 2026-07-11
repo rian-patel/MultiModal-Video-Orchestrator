@@ -174,6 +174,42 @@ test('fidelity knobs: motion preset maps to catalog UUID, strength + model are a
   assert.equal(unknown.motions[0].id, MOTION_IDS.dolly_in, 'unknown preset falls back to Dolly In');
 });
 
+test('seedance models hit the seedance endpoint with its own body shape', async () => {
+  const { workDir, assets, shots } = await setup(1);
+  const submitted: { url: string; params: Record<string, unknown> }[] = [];
+  const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith('/files/generate-upload-url')) {
+      return Response.json({ upload_url: 'https://uploads.example/put/0', public_url: 'https://cdn.example/img/0.jpg' });
+    }
+    if (init?.method === 'PUT') return new Response(null, { status: 200 });
+    if (init?.method === 'POST') {
+      submitted.push({ url: u, params: (JSON.parse(String(init.body)) as { params: Record<string, unknown> }).params });
+      return Response.json({ id: 'jobset_1' });
+    }
+    if (u.includes('/requests/')) return Response.json({ status: 'completed', video: { url: 'https://cdn.example/x.mp4' } });
+    return new Response(CLIP_BYTES, { status: 200 });
+  }) as typeof fetch;
+
+  const out = await makeEngine(fetchImpl, { model: 'seedance_pro' }).process({ shots, assets }, makeCtx(workDir));
+  assert.equal(out[0].status, 'done');
+  assert.equal(submitted.length, 1);
+  assert.match(submitted[0].url, /\/v1\/image2video\/seedance$/);
+  const p = submitted[0].params;
+  // Seedance traps (verified live): `prompts` must be an ARRAY (a bare
+  // `prompt` is silently dropped -> a promptless clip invented a person), and
+  // there is no motion catalog — so no `motions` and no bare `prompt` here.
+  assert.deepEqual(p.prompts, ['prompt 0'], 'prompt travels in the prompts array');
+  assert.equal(p.prompt, undefined);
+  assert.equal(p.motions, undefined);
+  assert.deepEqual(p.input_image, { type: 'image_url', image_url: 'https://cdn.example/img/0.jpg' });
+  assert.equal(p.resolution, '1080', 'native 1080p from config resolution');
+  assert.equal(p.duration, 5, 'config clipDurationSec');
+  assert.equal(p.aspect_ratio, '16:9');
+  assert.equal(p.camera_fixed, false, 'camera carries the motion, not scene animation');
+  assert.equal(p.enhance_prompt, false, 'platform prompt-enhancer stays off');
+});
+
 test('transient submit failure is retried within the shot', async () => {
   const { workDir, assets, shots } = await setup(1);
   const api = fakeApi({ failSubmits: 1 }); // first submit 500s, retry succeeds

@@ -1,16 +1,20 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { mapWithConcurrency } from '@rev/core';
-import type { Engine, EngineContext, Shot } from '@rev/core';
+import type { Engine, EngineContext, PipelineConfig, Shot } from '@rev/core';
 import type { VideoGenInput } from './types';
 
 /** v2 DoP model variants (POST /v1/image2video/dop `params.model`). */
 export type DopModel = 'dop-turbo' | 'dop-lite' | 'dop-preview';
+/** Seedance variants (POST /v1/image2video/seedance) — native 1080p. */
+export type SeedanceModel = 'seedance_pro' | 'seedance_lite';
+export type VideoModel = DopModel | SeedanceModel;
 
 export interface HiggsfieldOptions {
   /** Platform API credentials, "key:secret" (docs.higgsfield.ai). */
   apiKey?: string;
-  /** DoP model variant. Unknown/legacy values are normalized to the default. */
+  /** Model: dop-* (720p, motion-strength lever) or seedance_* (native 1080p,
+   * prompt-driven camera). Unknown/legacy values normalize to the default. */
   model?: string;
   baseUrl?: string;
   /**
@@ -48,8 +52,9 @@ interface StatusResponse {
   video_url?: string;
 }
 
-const DEFAULT_MODEL: DopModel = 'dop-turbo';
+const DEFAULT_MODEL: VideoModel = 'dop-turbo';
 const DOP_MODELS: ReadonlySet<string> = new Set(['dop-turbo', 'dop-lite', 'dop-preview']);
+const SEEDANCE_MODELS: ReadonlySet<string> = new Set(['seedance_pro', 'seedance_lite']);
 
 /**
  * Our motion presets (see engine-prompt/templates.ts) mapped onto Higgsfield's
@@ -76,20 +81,28 @@ const FALLBACK_MOTION_ID = MOTION_IDS.dolly_in;
  * (https://platform.higgsfield.ai, schema probed live 2026-07):
  *   POST /files/generate-upload-url { content_type } -> { upload_url, public_url }
  *   PUT  {upload_url} (raw image bytes)              -> (image now hosted)
- *   POST /v1/image2video/dop { params: { prompt, input_images, model,
- *        motions: [{id, strength}], enhance_prompt } } -> { id, jobs: [...] }
- *   GET  /requests/{id}/status                       -> { status, video.url }
- * The v2 endpoint exists specifically for its `motions[].strength` (0..1) —
- * the legacy POST /{model} path cannot limit camera travel, and unrestrained
- * travel is what caused property hallucination. (image_url must be a hosted
- * URL ≤2083 chars, NOT a data URI — 422 url_too_long. Clip length is fixed by
- * the model, ~5s; there is no duration param.) Failures are isolated per shot
- * (status 'failed'); the run only fails when every clip fails.
+ *   POST /v1/image2video/dop      (dop-* models)     -> { id, jobs: [...] }
+ *   POST /v1/image2video/seedance (seedance_* models)-> { id, jobs: [...] }
+ *   GET  /requests/{id}/status (either id)           -> { status, video.url }
+ *
+ * Model families and their fidelity levers:
+ * - dop-*: fixed 1280x720 output. `motions: [{id, strength}]` — low strength
+ *   (0..1) caps camera travel, THE anti-hallucination lever on this family.
+ *   No duration param (~5s clips).
+ * - seedance_*: native 1080p (crisper end product; ~3.5x cost, faster wall
+ *   time observed). No motion catalog / strength — the camera move rides in
+ *   the prompt (`prompts` ARRAY; a bare `prompt` is silently dropped and a
+ *   promptless run invented a person — verified live). camera_fixed:false +
+ *   fidelity-first prompt + the fidelity audit are the controls here.
+ *
+ * (image_url must be a hosted URL ≤2083 chars, NOT a data URI — 422
+ * url_too_long.) Failures are isolated per shot (status 'failed'); the run
+ * only fails when every clip fails.
  */
 export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
   readonly name = 'videogen:higgsfield';
   private apiKey: string;
-  private model: DopModel;
+  private model: VideoModel;
   private baseUrl: string;
   private motionStrength: number;
   private maxConcurrency: number;
@@ -102,8 +115,10 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     this.apiKey = opts.apiKey ?? process.env.HIGGSFIELD_API_KEY ?? '';
     const rawModel = opts.model ?? process.env.HIGGSFIELD_MODEL ?? DEFAULT_MODEL;
     // Legacy configs may still say e.g. "higgsfield-ai/dop/standard" — the v2
-    // endpoint rejects anything outside its enum, so normalize.
-    this.model = (DOP_MODELS.has(rawModel) ? rawModel : DEFAULT_MODEL) as DopModel;
+    // endpoints reject anything outside their enums, so normalize.
+    this.model = (
+      DOP_MODELS.has(rawModel) || SEEDANCE_MODELS.has(rawModel) ? rawModel : DEFAULT_MODEL
+    ) as VideoModel;
     this.baseUrl = (opts.baseUrl ?? 'https://platform.higgsfield.ai').replace(/\/+$/, '');
     const rawStrength = opts.motionStrength ?? Number(process.env.HIGGSFIELD_MOTION_STRENGTH ?? 0.3);
     this.motionStrength = Math.min(1, Math.max(0, Number.isFinite(rawStrength) ? rawStrength : 0.3));
@@ -144,7 +159,11 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     if (ok === 0) {
       throw new Error(`All ${shots.length} clip generations failed — cannot produce a video.`);
     }
-    ctx.logger.info(`Generated ${ok}/${shots.length} clips via ${this.model} @ strength ${this.motionStrength}`);
+    ctx.logger.info(
+      SEEDANCE_MODELS.has(this.model)
+        ? `Generated ${ok}/${shots.length} clips via ${this.model} (native 1080p, prompt-driven camera)`
+        : `Generated ${ok}/${shots.length} clips via ${this.model} @ strength ${this.motionStrength}`,
+    );
     return shots;
   }
 
@@ -166,7 +185,7 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     let requestId: string | undefined;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       try {
-        requestId = await this.submit(sourcePath, shot);
+        requestId = await this.submit(sourcePath, shot, ctx.config);
         break;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
@@ -191,32 +210,53 @@ export class HiggsfieldVideoGenEngine implements Engine<VideoGenInput, Shot[]> {
     }
   }
 
-  private async submit(sourcePath: string, shot: Shot): Promise<string> {
+  private async submit(sourcePath: string, shot: Shot, config: PipelineConfig): Promise<string> {
     // Local-first app: photos aren't publicly reachable, and the platform
     // rejects data URIs (422 url_too_long, 2083-char cap). So upload the image
     // to Higgsfield's CDN first and submit the returned hosted URL.
     const imageUrl = await this.uploadImage(sourcePath);
-    const motionId = MOTION_IDS[shot.motionPreset ?? ''] ?? FALLBACK_MOTION_ID;
-    const res = await this.fetch(`${this.baseUrl}/v1/image2video/dop`, {
+    const prompt = shot.prompt ?? 'A slow, subtle push-in with minimal travel. Photoreal, no people.';
+    const seedance = SEEDANCE_MODELS.has(this.model);
+
+    // Both bodies disable the platform's prompt "enhancer" — it embellishes
+    // the prompt and is a source of invented detail (fidelity over creativity
+    // for real-estate accuracy).
+    const params: Record<string, unknown> = seedance
+      ? {
+          // Seedance (native 1080p). Traps verified live 2026-07: a bare
+          // `prompt` field is SILENTLY DROPPED (must be `prompts` array; the
+          // promptless clip invented a person), and the DoP motion catalog is
+          // rejected ("Motion not found") — the camera move rides in the
+          // prompt text. camera_fixed:false makes the camera carry the motion
+          // instead of the model animating the scene contents.
+          prompts: [prompt],
+          input_image: { type: 'image_url', image_url: imageUrl },
+          model: this.model,
+          resolution: config.resolution.height >= 1080 ? '1080' : '720',
+          duration: Math.min(12, Math.max(3, Math.round(config.clipDurationSec))),
+          aspect_ratio: '16:9',
+          camera_fixed: false,
+          enhance_prompt: false,
+        }
+      : {
+          prompt,
+          input_images: [{ type: 'image_url', image_url: imageUrl }],
+          model: this.model,
+          // Low strength caps camera travel (fidelity); the preset picks the
+          // move direction the Prompt engine chose for this room.
+          motions: [
+            { id: MOTION_IDS[shot.motionPreset ?? ''] ?? FALLBACK_MOTION_ID, strength: this.motionStrength },
+          ],
+          enhance_prompt: false,
+        };
+
+    const res = await this.fetch(`${this.baseUrl}/v1/image2video/${seedance ? 'seedance' : 'dop'}`, {
       method: 'POST',
       headers: {
         authorization: `Key ${this.apiKey}`,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({
-        params: {
-          prompt: shot.prompt ?? 'A slow, subtle push-in with minimal travel. Photoreal, no people.',
-          input_images: [{ type: 'image_url', image_url: imageUrl }],
-          model: this.model,
-          // Low strength caps camera travel (fidelity); the preset picks the
-          // move direction the Prompt engine chose for this room.
-          motions: [{ id: motionId, strength: this.motionStrength }],
-          // Disable the platform's prompt "enhancer" — it embellishes the
-          // prompt and is a source of invented detail (fidelity over
-          // creativity for real-estate accuracy).
-          enhance_prompt: false,
-        },
-      }),
+      body: JSON.stringify({ params }),
     });
     if (!res.ok) {
       throw new Error(`submit failed: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);

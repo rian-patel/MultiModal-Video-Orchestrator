@@ -317,6 +317,24 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
   consumer MCP subscription, not the API-key pool. Revisit if Higgsfield ships it.
   8 new tests (53 total). Verified over HTTP: branded 30s demo → 34.5s master
   (cards eyeballed correct) + 1080x1920 vertical, both stream w/ Range + download names.
+- [x] **Phase 10a — video quality investigation (2026-07)** — root cause of soft output:
+  **DoP is hard-capped at 1280x720** (no resolution params — probed) and render was
+  stretching it to 1080p with bicubic. Fixes landed: (1) free render sharpening —
+  `flags=lanczos` + `unsharp=5:5:0.30` in the normalize chain. (2) **Seedance support**
+  (`HIGGSFIELD_MODEL=seedance_pro|seedance_lite`, opt-in): the platform quietly hosts
+  premium i2v models at `/v1/image2video/{kling,seedance,minimax}`; Seedance does
+  **native 1080p** (1920x1088@24fps, ~69s/clip vs DoP's ~5min) at ~3.5x DoP's per-clip
+  cost. **Seedance traps (verified live, cost a clip):** a bare `prompt` field is
+  SILENTLY DROPPED (must be `prompts: string[]`) — the promptless clip invented a
+  person walking through the living room, which `scripts/audit-clip.ts` (new: standalone
+  fidelity audit of any clip) correctly flagged DRIFT; DoP's motion catalog is rejected
+  ("Motion not found") so the camera move rides in the prompt text; `camera_fixed`
+  defaults true (model then animates scene contents instead — that's when the person
+  appeared). Corrected clip (prompts array + camera_fixed:false): faithful (audit
+  verdict FAITHFUL), deliberate dolly-in, visibly crisper 1:1 than DoP.
+  **Decision: default stays dop-turbo (user chose cost over 1080p);** Seedance is one
+  env var away. Kling (`kling-v2-1[-master]`, 5|10s) + Minimax (1080p, 6s min) exist
+  but are unprobed beyond schema. No video-upscale model exists on the API-key pool.
 - [ ] **Phase 10b+** — (a) measure fidelity-audit false-positive rate on a full real run.
   (b) beat-aware pacing + music — **user opted out of music for now** (revisit only if
   asked; no licensed assets). (c) Tauri desktop packaging. (d) full real-photo run

@@ -27,11 +27,16 @@ export function buildXfadeGraph(
   height: number,
 ): XfadeGraph {
   const n = durations.length;
+  // lanczos + a light unsharp: source clips are often below the target frame
+  // (Higgsfield DoP is fixed 720p), and the default bicubic stretch is visibly
+  // soft at 1080p. Lanczos keeps edges tighter and the mild unsharp restores
+  // perceived detail without haloing (0.3 luma amount is below ringing range).
   const norm = durations
     .map(
       (d, i) =>
-        `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,fps=${FPS},settb=AVTB,` +
+        `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos,` +
+        `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,unsharp=5:5:0.30:5:5:0.0,` +
+        `fps=${FPS},settb=AVTB,` +
         `trim=duration=${d.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`,
     )
     .join(';');
