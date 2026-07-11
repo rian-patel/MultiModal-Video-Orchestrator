@@ -4,6 +4,10 @@ interface Props {
   result: CompleteEventData;
 }
 
+/** Append the download flag whether or not the URL already has a query
+ * string (local API URLs are bare; hosted signed URLs carry a token). */
+const downloadHref = (url: string) => `${url}${url.includes('?') ? '&' : '?'}download`;
+
 /** The finished tour: in-app playback plus a download link. */
 export function ResultCard({ result }: Props) {
   return (
@@ -30,7 +34,7 @@ export function ResultCard({ result }: Props) {
 
       <div className="mt-3 flex gap-2">
         <a
-          href={`${result.videoUrl}?download`}
+          href={downloadHref(result.videoUrl)}
           download
           className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-emerald-500 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-400"
         >
@@ -39,7 +43,7 @@ export function ResultCard({ result }: Props) {
         </a>
         {result.verticalUrl && (
           <a
-            href={`${result.verticalUrl}&download`}
+            href={downloadHref(result.verticalUrl)}
             download
             title="9:16 cut for Reels / TikTok / Shorts"
             className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/10 py-2.5 text-sm font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/20"

@@ -1,0 +1,24 @@
+{
+  "name": "@rev/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "trigger dev",
+    "deploy": "trigger deploy"
+  },
+  "dependencies": {
+    "@rev/core": "*",
+    "@rev/engine-fidelity": "*",
+    "@rev/engine-upload": "*",
+    "@rev/engine-videogen": "*",
+    "@rev/engine-vision": "*",
+    "@rev/hosted": "*",
+    "@rev/orchestrator": "*",
+    "@trigger.dev/sdk": "^4.0.0"
+  },
+  "devDependencies": {
+    "@trigger.dev/build": "^4.0.0",
+    "trigger.dev": "^4.0.0"
+  }
+}

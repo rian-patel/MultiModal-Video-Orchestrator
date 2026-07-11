@@ -87,10 +87,17 @@ packages/
   engine-fidelity/   @rev/engine-fidelity — post-videogen hallucination audit
   engine-render/     @rev/engine-render
   orchestrator/      @rev/orchestrator — pipeline runner + persistence + progress
+  hosted/            @rev/hosted — Supabase adapters for hosted mode (project store,
+                     blob store, progress sink, path rebase + artifact sync)
 apps/
   server/            @rev/server — Fastify (port 3001): REST + SSE, wired to the pipeline
                      (main.ts, app.ts, runs.ts = in-memory RunRegistry w/ replay buffer,
                       routes/health.ts, routes/runs.ts, paths.ts = repo-root resolution)
+  worker/            @rev/worker — Trigger.dev task `generate-tour` (hostedRun.ts glue:
+                     hydrate from Supabase -> runPipeline -> mirror checkpoints/artifacts)
+supabase/            migrations/0001_init.sql (projects, run_events, buckets, RLS) +
+                     functions/{start-run,resume-run} (Deno edge functions; NOT in the
+                     root tsconfig — they typecheck under Deno, not Node)
   web/               @rev/web — React 19 + Vite + Tailwind v4 (port 5173, /api proxied
                      to 3001): App.tsx, api.ts (SSE client), components/{Dropzone,
                      LengthSelector, BrandingSection (collapsible; agent identity
@@ -335,10 +342,33 @@ npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND ap
   **Decision: default stays dop-turbo (user chose cost over 1080p);** Seedance is one
   env var away. Kling (`kling-v2-1[-master]`, 5|10s) + Minimax (1080p, 6s min) exist
   but are unprobed beyond schema. No video-upscale model exists on the API-key pool.
-- [ ] **Phase 10b+** — (a) measure fidelity-audit false-positive rate on a full real run.
-  (b) beat-aware pacing + music — **user opted out of music for now** (revisit only if
-  asked; no licensed assets). (c) Tauri desktop packaging. (d) full real-photo run
-  through the browser UI (upload→review→generate→download) to shake out UX gaps.
+- [x] **Phase H1 — hosted multi-user alpha, repo side (2026-07)** — same code, two modes
+  (scoping memo: claude.ai/code/artifact/fc5a4ff3-3dea-4972-9df2-5243a2067ba0). Stack:
+  Vercel (web) + Supabase (auth/Postgres/Storage/Realtime = control plane) + Trigger.dev
+  (pipeline worker; no timeouts) + owner's API keys, invite-only, no billing (that's H2).
+  What landed: `onCheckpoint` hook on Run/ResumeOptions (mirrors every persisted
+  checkpoint; failure-path mirror errors are swallowed so they can't mask the real
+  error); FFMPEG_PATH env override in all 3 ffmpeg call sites (Trigger.dev's ffmpeg()
+  build extension provides a system binary); **@rev/hosted** (SupabaseProjectStore =
+  Project JSONB + promoted columns, SupabaseBlobStore, SupabaseProgressSink =
+  run_events rows replacing the SSE registry, rebaseProjectPaths = absolute-path remap
+  so resume works across ephemeral workers, ArtifactSync push/pull with
+  essential-vs-optional semantics); worker task `generate-tour` (retries hard-disabled:
+  a task retry would re-bill every clip — recovery is the resume flow); edge functions
+  start-run/resume-run (ownership via RLS-scoped select; photos validated to the
+  caller's own storage prefix); web hosted mode keyed off VITE_SUPABASE_URL (magic-link
+  SignIn, storage upload, Realtime watchRun with replay-by-select + dedupe,
+  `storage://` URLs signed client-side; review checkbox hidden — review flow is
+  local-only for now); gated GitHub Action deploy-hosted.yml (inert until
+  ENABLE_HOSTED_DEPLOY=true). 6 new tests (61 total). **Setup checklist: HOSTING.md.**
+  NOT yet done: live E2E against real Supabase/Trigger.dev accounts (needs user
+  account creation), hosted storyboard review, per-user quotas.
+- [ ] **Phase 10b+ / H2** — (a) measure fidelity-audit false-positive rate on a full
+  real run. (b) beat-aware pacing + music — **user opted out of music for now**
+  (revisit only if asked; no licensed assets). (c) Tauri desktop packaging. (d) full
+  real-photo run through the browser UI (upload→review→generate→download) to shake out
+  UX gaps. (e) H1 live verification once accounts exist, then H2: Stripe credit packs,
+  per-user quotas, hosted review flow.
 
 ## Key decisions (locked for MVP)
 

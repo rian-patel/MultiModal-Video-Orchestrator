@@ -23,8 +23,15 @@ const ROOM_COLOR: Record<RoomType, string> = {
   other: '0x888888',
 };
 
-function makeColorClip(path: string, color: string, durationSec: number): Promise<void> {
+function ffmpegBin(): string {
+  // Hosted workers provide a system ffmpeg via FFMPEG_PATH; ffmpeg-static
+  // covers local machines.
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
   if (!ffmpegPath) throw new Error('ffmpeg-static did not provide a binary');
+  return ffmpegPath;
+}
+
+function makeColorClip(path: string, color: string, durationSec: number): Promise<void> {
   const args = [
     '-f', 'lavfi',
     '-i', `color=c=${color}:s=1280x720:d=${durationSec}:r=30`,
@@ -32,7 +39,7 @@ function makeColorClip(path: string, color: string, durationSec: number): Promis
     '-y', path,
   ];
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath as string, args, { windowsHide: true });
+    const proc = spawn(ffmpegBin(), args, { windowsHide: true });
     let tail = '';
     proc.stderr.on('data', (c: Buffer) => (tail = (tail + c.toString()).slice(-1000)));
     proc.on('error', reject);

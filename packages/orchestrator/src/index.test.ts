@@ -304,3 +304,41 @@ test('branding is sanitized, the logo copied into the project, and passed to ren
   assert.equal(renderInputs[0].branding?.address, '128 Maple Grove Ln', 'render engine got the branding');
   assert.equal(saved.verticalPath, `${saved.outputPath}.v`, 'vertical path persisted');
 });
+
+test('onCheckpoint mirrors every persisted checkpoint, including the failure path', async () => {
+  const config = await tempConfig();
+  const stages: string[] = [];
+
+  const { project: done } = await runPipeline({
+    request: REQUEST,
+    targetDurationSec: 30,
+    config,
+    engines: { videogen: stubVideogen(), render: stubRender() },
+    onCheckpoint: (p) => { stages.push(p.stage); },
+  });
+  assert.equal(done.stage, 'complete');
+  assert.equal(stages[0], 'created', 'initial project row is mirrored');
+  assert.deepEqual(
+    stages.slice(1),
+    ['uploaded', 'analyzed', 'storyboarded', 'prompted', 'generating', 'generating', 'generating', 'rendering', 'complete'],
+    'every checkpoint reaches the mirror in order',
+  );
+
+  // Failure path: the hook still fires (with lastError set) and a hook error
+  // there must not mask the pipeline error.
+  const seen: (string | undefined)[] = [];
+  await assert.rejects(
+    runPipeline({
+      request: REQUEST,
+      targetDurationSec: 30,
+      config,
+      engines: { videogen: failingVideogen('boom') },
+      onCheckpoint: (p) => {
+        seen.push(p.lastError);
+        if (p.lastError) throw new Error('mirror down');
+      },
+    }),
+    /boom/,
+  );
+  assert.equal(seen[seen.length - 1], 'boom', 'failure checkpoint carried lastError to the mirror');
+});

@@ -1,0 +1,50 @@
+# Auto-deploys the hosted backend on push to main:
+#  - the Trigger.dev worker (pipeline task)
+#  - the Supabase edge functions (start-run / resume-run)
+# The Vercel frontend auto-deploys via Vercel's own GitHub integration, not here.
+#
+# INERT UNTIL ENABLED: set the repository variable ENABLE_HOSTED_DEPLOY=true
+# (Settings -> Secrets and variables -> Actions -> Variables) once the secrets
+# below exist. Required secrets:
+#   TRIGGER_ACCESS_TOKEN   Trigger.dev personal access token (dashboard)
+#   TRIGGER_PROJECT_REF    Trigger.dev project ref (proj_...)
+#   SUPABASE_ACCESS_TOKEN  supabase.com access token
+#   SUPABASE_PROJECT_REF   Supabase project ref (the subdomain of your project URL)
+name: deploy-hosted
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/worker/**'
+      - 'packages/**'
+      - 'supabase/functions/**'
+      - '.github/workflows/deploy-hosted.yml'
+
+jobs:
+  worker:
+    if: ${{ vars.ENABLE_HOSTED_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Deploy Trigger.dev worker
+        working-directory: apps/worker
+        env:
+          TRIGGER_ACCESS_TOKEN: ${{ secrets.TRIGGER_ACCESS_TOKEN }}
+          TRIGGER_PROJECT_REF: ${{ secrets.TRIGGER_PROJECT_REF }}
+        run: npx trigger.dev@latest deploy
+
+  edge-functions:
+    if: ${{ vars.ENABLE_HOSTED_DEPLOY == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+      - name: Deploy edge functions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: supabase functions deploy --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}

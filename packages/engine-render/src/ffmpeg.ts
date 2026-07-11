@@ -67,6 +67,9 @@ export function buildXfadeGraph(
 }
 
 function ffmpegBin(): string {
+  // Hosted workers (e.g. Trigger.dev's ffmpeg build extension) provide a
+  // system ffmpeg via FFMPEG_PATH; ffmpeg-static covers local machines.
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
   if (!ffmpegPath) throw new Error('ffmpeg-static did not provide a binary for this platform');
   return ffmpegPath;
 }

@@ -25,8 +25,15 @@ export async function extractFrames(
   );
 }
 
-function extractOne(clipPath: string, atSec: number, maxDim: number): Promise<Buffer> {
+function ffmpegBin(): string {
+  // Hosted workers provide a system ffmpeg via FFMPEG_PATH; ffmpeg-static
+  // covers local machines.
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
   if (!ffmpegPath) throw new Error('ffmpeg-static did not provide a binary');
+  return ffmpegPath;
+}
+
+function extractOne(clipPath: string, atSec: number, maxDim: number): Promise<Buffer> {
   const args = [
     '-ss', atSec.toFixed(3),
     '-i', clipPath,
@@ -36,7 +43,7 @@ function extractOne(clipPath: string, atSec: number, maxDim: number): Promise<Bu
     'pipe:1',
   ];
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath as string, args, { windowsHide: true });
+    const proc = spawn(ffmpegBin(), args, { windowsHide: true });
     const chunks: Buffer[] = [];
     let errTail = '';
     proc.stdout.on('data', (c: Buffer) => chunks.push(c));

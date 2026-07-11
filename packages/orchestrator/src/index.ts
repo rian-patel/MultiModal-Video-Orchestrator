@@ -73,6 +73,11 @@ export interface RunOptions {
    * anywhere readable (e.g. an upload temp dir) — it is copied into the
    * project workDir at run start, so resumes never depend on temp files. */
   branding?: Branding;
+  /** Called after every checkpoint persist with the current project state.
+   * Hosted deployments mirror the project into their database here; local
+   * runs leave it unset. A thrown error fails the run (except in the
+   * failure path, where it is swallowed so it can't mask the real error). */
+  onCheckpoint?: (project: Project) => Promise<void> | void;
 }
 
 export interface ResumeOptions {
@@ -80,6 +85,8 @@ export interface ResumeOptions {
   config?: PipelineConfig;
   engines?: Partial<PipelineEngines>;
   onProgress?: (globalPct: number, stage: string, msg: string) => void;
+  /** See RunOptions.onCheckpoint. */
+  onCheckpoint?: (project: Project) => Promise<void> | void;
 }
 
 export interface RunResult {
@@ -131,6 +138,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   await ensureProjectDirs(workDir);
   if (opts.branding) project.branding = await adoptBranding(opts.branding, workDir);
   await saveProject(workDir, project);
+  await opts.onCheckpoint?.(project);
   opts.onProject?.(project.id);
   return executeFrom(project, workDir, 'upload', config, opts, opts.request);
 }
@@ -164,12 +172,19 @@ async function executeFrom(
   workDir: string,
   from: PipelineStage,
   config: PipelineConfig,
-  opts: Pick<RunOptions, 'engines' | 'onProgress' | 'stopAfter'>,
+  opts: Pick<RunOptions, 'engines' | 'onProgress' | 'stopAfter' | 'onCheckpoint'>,
   request?: UploadRequest,
 ): Promise<RunResult> {
   const engines = { ...defaultEngines(), ...opts.engines };
   const logger = createLogger('orchestrator');
   const start = STAGES.indexOf(from);
+  // Every checkpoint goes to disk first (the local source of truth), then to
+  // the optional mirror (hosted DB). Both or neither: a failed mirror fails
+  // the run rather than silently diverging.
+  const persist = async () => {
+    await saveProject(workDir, project);
+    await opts.onCheckpoint?.(project);
+  };
   logger.info(
     start === 0
       ? `Project ${project.id} -> ${workDir}`
@@ -193,14 +208,14 @@ async function executeFrom(
       if (!request) throw new Error('upload stage requires the original upload request');
       project.assets = await engines.upload.process(request, ctxFor(0, 'upload'));
       project.stage = 'uploaded';
-      await saveProject(workDir, project);
+      await persist();
     }
 
     // 2. Vision
     if (start <= 1) {
       project.vision = await engines.vision.process(project.assets, ctxFor(1, 'vision'));
       project.stage = 'analyzed';
-      await saveProject(workDir, project);
+      await persist();
     }
 
     // 3. Storyboard
@@ -210,7 +225,7 @@ async function executeFrom(
         ctxFor(2, 'storyboard'),
       );
       project.stage = 'storyboarded';
-      await saveProject(workDir, project);
+      await persist();
     }
 
     // 4. Prompt
@@ -220,7 +235,7 @@ async function executeFrom(
         ctxFor(3, 'prompt'),
       );
       project.stage = 'prompted';
-      await saveProject(workDir, project);
+      await persist();
     }
 
     // Review pause: hand the storyboard back to the user before spending on
@@ -237,19 +252,19 @@ async function executeFrom(
     //    marked 'failed' (render skips it; resume regenerates it).
     if (start <= 4) {
       project.stage = 'generating';
-      await saveProject(workDir, project);
+      await persist();
       project.shots = await generateClips(project, engines.videogen, ctxFor(4, 'videogen'));
-      await saveProject(workDir, project);
+      await persist();
       project.shots = await engines.fidelity.process(
         { shots: project.shots, assets: project.assets },
         ctxFor(4, 'fidelity'),
       );
-      await saveProject(workDir, project);
+      await persist();
     }
 
     // 6. Render (always runs — cheap, local, idempotent)
     project.stage = 'rendering';
-    await saveProject(workDir, project);
+    await persist();
     const outputPath = join(workDir, 'output', 'tour.mp4');
     const render = await engines.render.process(
       { shots: project.shots, outputPath, branding: project.branding },
@@ -258,7 +273,7 @@ async function executeFrom(
     project.outputPath = render.outputPath;
     project.verticalPath = render.verticalPath;
     project.stage = 'complete';
-    await saveProject(workDir, project);
+    await persist();
 
     logger.info(`Complete -> ${render.outputPath} (~${render.totalDurationSec}s)`);
     return { project, render };
@@ -267,6 +282,11 @@ async function executeFrom(
     // record why the run stopped.
     project.lastError = err instanceof Error ? err.message : String(err);
     await saveProject(workDir, project);
+    try {
+      await opts.onCheckpoint?.(project);
+    } catch {
+      // A failing mirror must not mask the real pipeline error.
+    }
     throw err;
   }
 }
