@@ -6,7 +6,7 @@ model to recover room type, lighting, composition quality and a suggested camera
 orders the shots into a logical walk-through of the house, composes a fidelity-constrained
 motion prompt per shot, animates each still into a live clip with Higgsfield image-to-video,
 audits every generated clip against its source photo so no fabricated furniture or rooms
-ever ship, and stitches the clips with FFmpeg into a crossfaded, exactly-timed 1080p MP4 —
+ever ship, and stitches the clips with FFmpeg into a crossfaded, exactly-timed 1080p MP4,
 with optional agent branding (title card, end card, logo watermark) and an automatic
 9:16 vertical cut for social.
 
@@ -84,8 +84,8 @@ identical moves in a row are automatically varied.
 
 Each shot's still is animated into a five-second clip through the Higgsfield platform. The default
 model is the Director-of-Photography (DoP) family, submitted with a catalog motion preset at a
-deliberately **low motion strength (0.3)** — less camera travel means less occluded geometry the
-model must synthesize, which is the single most effective anti-hallucination lever — and with the
+deliberately **low motion strength (0.3)** (less camera travel means less occluded geometry the
+model must synthesize, which is the single most effective anti-hallucination lever), and with the
 platform prompt-enhancer disabled. ByteDance's Seedance is wired as an opt-in alternative
 (`HIGGSFIELD_MODEL=seedance_pro`): native 1080p output and faster generation at roughly 3.5x the
 per-clip cost. The engine uploads the normalized photo to the platform CDN, submits, polls to
@@ -99,14 +99,14 @@ After generation, a vision model compares sampled frames from each clip (one anc
 plus three across the back half) against the source photo under a materiality rubric: people,
 added or removed furniture, layout changes, and contradicting door-reveals are drift; softness,
 lighting shifts, and plausible sliver continuations are fine. A drifted clip is marked failed,
-dropped from the cut, and regenerated on resume — a shorter honest tour always beats shipping a
+dropped from the cut, and regenerated on resume: a shorter honest tour always beats shipping a
 fabrication. The audit fails open: an audit error keeps the paid clip for a later re-check rather
 than destroying it. (Verified live: a promptless test clip that invented a person walking through
 a living room was correctly caught and dropped.)
 
 ### Branding and formats
 
-Optional branding fields — property address, agent name, phone, email, logo — become a serif title
+Optional branding fields (property address, agent name, phone, email, logo) become a serif title
 card, a contact end card, and a subtle corner logo watermark shown only during the tour. Agent
 identity persists in the browser so it is typed once, not per listing. Every render also derives a
 9:16 vertical cut (the master centered over a blurred fill) for Reels/TikTok/Shorts at zero extra
@@ -205,8 +205,8 @@ The substance of the project is the discipline between the drop zone and the fil
    pass. Audit errors fail open, keeping the paid clip for a later re-check.
 
 7. **Render.** FFmpeg builds one `filter_complex`: normalize (lanczos + light unsharp) and trim
-   every clip — plus branded title/end cards and a timeline-gated logo watermark when branding is
-   set — then chain crossfades where transition `k` begins at `sum(durations[0..k-1]) - k *
+   every clip, plus branded title/end cards and a timeline-gated logo watermark when branding is
+   set, then chain crossfades where transition `k` begins at `sum(durations[0..k-1]) - k *
    crossfade`. The graph is encoded to H.264 1080p, encode progress is parsed from FFmpeg's stderr
    time output, and a 9:16 blur-pad vertical cut is derived from the finished master.
 
@@ -222,14 +222,14 @@ translational move aimed at a prompt-named target will fabricate that target. Th
 this on the generative path with three preventive levers plus a backstop:
 
 - **No scene description, no directional target.** The prompt carries only a neutral move and a
-  hard "do not add, remove, move, or invent anything" constraint — the image is the sole authority
+  hard "do not add, remove, move, or invent anything" constraint: the image is the sole authority
   on contents.
 - **Prompt-enhancer disabled.** The platform's enhancer embellishes prompts and invents detail;
   `enhance_prompt: false` is schema-validated on every submit.
 - **Low motion strength (DoP).** Strength 0.3 caps camera travel, which caps how much unseen
   geometry the model must dream up. Verified live on the photo that originally produced a
   fabricated dining table: all visible content preserved.
-- **The audit backstop.** Prevention cannot be total — a generative model always retains latitude —
+- **The audit backstop.** Prevention cannot be total (a generative model always retains latitude),
   so every clip is audited frame-by-frame against its source photo and dropped on material drift.
   The failure mode is a regenerated clip, never a shipped fabrication.
 
@@ -412,7 +412,7 @@ The full pipeline is implemented and verified end to end: real vision analysis, 
 construction, fidelity-first prompting, Higgsfield generation with a low-motion-strength fidelity
 lever, a per-clip fidelity audit that drops (and later regenerates) any clip that drifts from its
 source photo, and an FFmpeg render with optional branding cards, logo watermark, and an automatic
-9:16 vertical cut — plus a storyboard review screen, resumable runs that never re-pay for finished
+9:16 vertical cut, plus a storyboard review screen, resumable runs that never re-pay for finished
 clips, and in-app preview and download of both formats. Native-1080p generation via Seedance is
 wired as an env-var opt-in (the default DoP model is capped at 720p, sharpened on the upscale).
 Planned next: a full real-listing run to measure the audit's false-positive rate, beat-aware
