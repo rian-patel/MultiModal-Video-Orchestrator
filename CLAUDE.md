@@ -36,13 +36,14 @@ motion strength 0.3 (Seedance native-1080p opt-in), Claude per-clip fidelity aud
 clip dropped + regenerated on resume), FFmpeg render with branding cards/watermark + lanczos
 sharpening + 9:16 vertical, storyboard review screen (local), checkpointed resume that never
 re-bills a finished clip, live progress (SSE local / Realtime hosted), in-app preview + download.
-**61 unit tests** (node:test via tsx), typecheck clean across packages, server, worker, web.
+**67 unit tests** (node:test via tsx), typecheck clean across packages, server, worker, web.
 
 Real artifacts produced: `projects/real-tour/tour.mp4` (first real tour), prototype clips under
 `projects/prototype/`. Higgsfield credits are real money: see 6.3 before touching videogen.
 
-Hosted H1 status: all repo-side code complete and unit-tested; **live E2E pends account creation**
-(Supabase/Trigger.dev/Vercel, HOSTING.md). Hosted launch is gated on the P0 items in section 9.
+Hosted H1 status: all repo-side code complete and unit-tested, **including the four P0 spend/abuse
+gates** (per-user run caps, global execution serialization, worker key fail-fast, storage caps;
+built 2026-07-12). **Live E2E pends account creation** (Supabase/Trigger.dev/Vercel, HOSTING.md).
 
 ## 3. Architecture
 
@@ -97,14 +98,15 @@ packages/
   engine-render/     ffmpeg graph builder, cards.ts (SVG->PNG branding), vertical derivation
   orchestrator/      runPipeline/resumePipeline, persistence, onCheckpoint mirror hook
   hosted/            Supabase adapters: project store (JSONB), blob store, progress sink,
-                     rebaseProjectPaths + ArtifactSync (cross-worker resume)
+                     run ledger (spend-cap bookkeeping), rebaseProjectPaths + ArtifactSync
 apps/
   server/            Fastify 127.0.0.1:3001, REST + SSE, in-memory RunRegistry w/ replay
   web/               React 19 + Vite + Tailwind v4 (5173, /api proxied). Hosted mode switches on
                      via VITE_SUPABASE_URL (SignIn, storage upload, Realtime watch)
   worker/            Trigger.dev task `generate-tour` (hostedRun.ts glue); retries disabled
-supabase/            migrations/0001_init.sql (RLS, buckets) + Deno edge functions
-                     start-run / resume-run (NOT in root tsconfig; Deno-typed)
+supabase/            migrations/ (0001 schema/RLS/buckets, 0002 runs ledger + storage caps) +
+                     Deno edge functions start-run / resume-run + _shared/ (runs.ts pure gate is
+                     Node-tested; enqueue.ts is Deno-only). Deno files are NOT in root tsconfig.
 scripts/             demo, analyze, storyboard-preview, render, smoke/prototype/audit tools
 projects/<id>/       per-run working dir: source/ thumbs/ clips/ branding/ output/ project.json (gitignored)
 AUDIT.md             full 2026-07-11 engineering audit  ·  HOSTING.md hosted setup checklist
@@ -160,9 +162,9 @@ Posture verified by the audit; keep these true:
   never receive service credentials; artifacts are served via short-lived signed URLs.
 - Path handling: project ids validated `/^[\w-]+$/`; filenames pass `basename()` + allowlist;
   storage paths validated against the caller's own prefix.
-- Known open items (do not consider these solved; roadmap numbers): local CSRF hardening (#5),
-  hosted spend caps (#1), duplicate-run concurrency (#2), worker key fail-fast (#3), Supabase
-  object-size cap (#4).
+- Hosted spend/abuse gates are DONE (roadmap P0 1-4): per-user run caps + daily cap enforced by
+  the service-role `runs` ledger (users cannot forge it); global task concurrency 1; worker key
+  fail-fast; photos bucket 30 MB / image-only. Still open: local CSRF hardening (#5).
 
 ## 6. Operational knowledge (hard-won, keep current)
 
@@ -294,16 +296,19 @@ exactly; too few photos = full-length clips + warning, never padding.
 
 ## 9. Roadmap (prioritized; reasoning in AUDIT.md section 5)
 
-**Next implementation milestone: "Safe to invite" = items 1-4 + HOSTING.md account wiring + one
-live hosted E2E run.** Then H1.5 = items 7-8 (hosted review). Then H2 = Stripe credit packs +
-quotas UI + fidelity-informed pricing.
+**Next implementation milestone: "Safe to invite" = HOSTING.md account wiring + one live hosted
+E2E run.** The four P0 code gates are DONE (below). Then H1.5 = items 7-8 (hosted review). Then
+H2 = Stripe credit packs + quotas UI + fidelity-informed pricing.
 
-P0 (gate on the first hosted invite; local is unaffected today):
-1. Per-user run caps + active-run limit in the edge functions (uncapped third-party spend).
-2. Project-keyed concurrency (Trigger.dev queue key, concurrency 1) + reject duplicate resume
-   (double-billing race).
-3. Hosted worker fails fast when ANTHROPIC/HIGGSFIELD keys are missing (no mock mode hosted).
-4. Supabase max-object-size cap configured + added to HOSTING.md.
+P0 (DONE 2026-07-12; code-complete, verified only by unit tests until a live account exists):
+1. [x] Per-user run caps: `runs` ledger (migration 0002), service-role reserve in the edge
+   functions, pure `evaluateRunGate` (max 1 active/user, 20/day, 2h stale window), worker marks
+   terminal via `SupabaseRunLedger`.
+2. [x] Duplicate-resume double-bill: `generate-tour` task `queue.concurrencyLimit: 1` (global
+   serialization, also matches Higgsfield's 2-job ceiling) + `idempotencyKey` on resume triggers.
+3. [x] Worker fails fast when either API key is missing (no hosted mock mode; spends nothing).
+4. [x] Storage caps: photos bucket 30 MB + image mime types only (migration 0002, not a dashboard
+   step).
 
 P1:
 5. Local CSRF/rebinding hardening: require a custom header on mutating routes + Host allowlist.
@@ -355,7 +360,7 @@ npm run storyboard <projectId> [targetSec]   # replay selection/prompts on saved
 npm run render <clipsDir> [out]              # stitch any folder of clips
 npx tsx scripts/smoke-higgsfield.ts          # ONE-clip live smoke test (spends ~5 credits) before any full run
 npx tsx scripts/audit-clip.ts <clip> <photo> # standalone fidelity audit of any clip
-npm test               # 61 tests; npm run typecheck  # root + web tsconfigs
+npm test               # 67 tests; npm run typecheck  # root + web tsconfigs
 npm run dev:server     # Fastify on 127.0.0.1:3001
 npm run dev:web        # Vite on 5173 (second terminal)
 ```

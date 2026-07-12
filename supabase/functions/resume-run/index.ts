@@ -4,6 +4,7 @@
 // not exist or is not theirs, and the response is the same 404 either way.
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 import { corsHeaders, json } from '../_shared/cors.ts';
+import { gateRun, newRunId, releaseRun, reserveRun, serviceClient, triggerTask } from '../_shared/enqueue.ts';
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
@@ -28,24 +29,26 @@ Deno.serve(async (req) => {
   if (!row) return json({ error: 'project not found' }, 404);
   if (row.stage === 'complete') return json({ error: 'Project is already complete.' }, 409);
   if (row.stage === 'created') {
-    return json({ error: 'This project cannot be resumed — start a new run.' }, 409);
+    return json({ error: 'This project cannot be resumed. Start a new run.' }, 409);
   }
 
-  const runId = `run_${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`;
-  const trigger = await fetch(
-    `${Deno.env.get('TRIGGER_API_URL') ?? 'https://api.trigger.dev'}/api/v1/tasks/generate-tour/trigger`,
-    {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${Deno.env.get('TRIGGER_SECRET_KEY')}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        payload: { runId, userId: user.id, resume: { projectId } },
-      }),
-    },
+  // Same per-user caps as a fresh run (an in-progress run blocks a resume).
+  const svc = serviceClient();
+  const gate = await gateRun(svc, user.id);
+  if (!gate.ok) return json({ error: gate.error }, gate.status);
+
+  const runId = newRunId();
+  await reserveRun(svc, runId, user.id, 'resume', projectId);
+
+  // idempotencyKey dedupes concurrent resume triggers of the SAME project at
+  // the trigger layer (belt to the gate's suspenders against the double-bill
+  // race); the task's global concurrencyLimit:1 serializes execution anyway.
+  const trigger = await triggerTask(
+    { runId, userId: user.id, resume: { projectId } },
+    { idempotencyKey: `resume-${projectId}` },
   );
   if (!trigger.ok) {
+    await releaseRun(svc, runId);
     const detail = (await trigger.text()).slice(0, 300);
     return json({ error: `could not enqueue the resume: ${trigger.status} ${detail}` }, 502);
   }

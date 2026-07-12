@@ -9,6 +9,7 @@ import { SupabaseBlobStore } from './blobStore';
 import { artifactKey, rebaseProjectPaths } from './paths';
 import { SupabaseProjectStore } from './projectStore';
 import { SupabaseProgressSink } from './progressSink';
+import { SupabaseRunLedger } from './runLedger';
 import { ArtifactSync } from './sync';
 import type { DbResult, SelectLike, SupabaseLike } from './types';
 
@@ -33,6 +34,14 @@ function fakeSupabase() {
         async insert(values: Row): Promise<DbResult> {
           rows.push(values);
           return { data: null, error: null };
+        },
+        update(values: Row) {
+          return {
+            async eq(col: string, val: unknown): Promise<DbResult> {
+              for (const r of rows) if (r[col] === val) Object.assign(r, values);
+              return { data: null, error: null };
+            },
+          };
         },
         select(): SelectLike {
           let filtered = [...rows];
@@ -201,4 +210,23 @@ test('artifactKey builds the user-scoped storage layout', () => {
     artifactKey('user-1', 'proj_h1', 'C:/scratch/clips/shot-00.mp4', 'clips'),
     'user-1/proj_h1/clips/shot-00.mp4',
   );
+});
+
+test('run ledger marks a reserved run terminal (releasing the active cap)', async () => {
+  const { client, tables } = fakeSupabase();
+  // Simulate an edge-function reservation.
+  await client.from('runs').insert({ id: 'run_1', user_id: 'user-1', kind: 'fresh', status: 'active' });
+  const ledger = new SupabaseRunLedger(client);
+
+  await ledger.finish('run_1', 'complete', 'proj_h1');
+  const row = tables.get('runs')![0];
+  assert.equal(row.status, 'complete');
+  assert.equal(row.project_id, 'proj_h1');
+  assert.ok(row.updated_at, 'updated_at stamped');
+
+  // A different run id must not be touched.
+  await client.from('runs').insert({ id: 'run_2', user_id: 'user-1', kind: 'resume', status: 'active' });
+  await ledger.finish('run_2', 'error');
+  assert.equal(tables.get('runs')![1].status, 'error');
+  assert.equal(tables.get('runs')![0].status, 'complete', 'run_1 unchanged');
 });

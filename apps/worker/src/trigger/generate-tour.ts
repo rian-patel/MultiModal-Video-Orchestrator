@@ -10,6 +10,14 @@ import { hostedRun, type GenerateTourPayload } from '../hostedRun';
 export const generateTour = task({
   id: 'generate-tour',
   retry: { maxAttempts: 1 },
+  // Global serialization: one run at a time across all users. One run uses up
+  // to 2 concurrent Higgsfield clips, which is exactly the account's 2-job
+  // plan ceiling, so this also removes the duplicate-resume double-bill race
+  // (two triggers for the same project can never execute at once). Raising
+  // this requires a higher Higgsfield concurrency plan first.
+  queue: { concurrencyLimit: 1 },
+  // ffmpeg encodes many 1080p streams; give it headroom over the default.
+  machine: 'small-2x',
   run: async (payload: GenerateTourPayload) => {
     await hostedRun(payload);
   },

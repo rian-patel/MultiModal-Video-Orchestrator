@@ -30,8 +30,10 @@ Costs on your accounts: Higgsfield ~5 credits/clip (DoP), Anthropic vision+audit
    ```bash
    npx supabase login
    npx supabase link --project-ref <ref>
-   npx supabase db push          # applies supabase/migrations/0001_init.sql
+   npx supabase db push          # applies migrations 0001_init + 0002_runs_and_limits
    ```
+   (0002 creates the `runs` ledger for the spend caps and sets the 30 MB / image-only limit on
+   the photos bucket, so there is no manual storage-limit dashboard step.)
 3. Make it invite-only: Dashboard -> Authentication -> Sign In / Providers -> Email -> turn **off** "Allow new users to sign up". Invite testers from Authentication -> Users -> "Invite user".
 4. Deploy the edge functions and give them the Trigger.dev key (created in step 2, so come back for the secret):
    ```bash
@@ -80,12 +82,34 @@ Until then, deploy manually with the commands above.
 4. The result card plays the tour and downloads both MP4s (16:9 + 9:16).
 5. If a run fails midway, the error card's Resume button re-enqueues from the last checkpoint; finished clips are pulled from storage, never re-billed.
 
+## Spend + abuse controls (P0, built 2026-07-12)
+
+These are enforced in code, not just docs:
+
+- **One run at a time per user, 20 runs/user/day** (`supabase/functions/_shared/runs.ts`,
+  `RUN_LIMITS`). A `runs` table row is reserved by the edge function (service role, so users
+  cannot forge it) before triggering; the worker marks it terminal when done. A crashed worker's
+  row ages out after 2h so nobody is wedged. Adjust the numbers in `RUN_LIMITS` and redeploy the
+  functions.
+- **Global execution serialization**: the `generate-tour` task has `queue.concurrencyLimit: 1`, so
+  exactly one run executes at a time across all users. One run uses up to 2 Higgsfield clips =
+  the account's 2-job plan ceiling. This also makes the duplicate-resume double-bill race
+  impossible. Raising throughput needs a higher Higgsfield concurrency plan first, then raise
+  this limit.
+- **Worker fails fast without keys**: a worker missing `ANTHROPIC_API_KEY` or `HIGGSFIELD_API_KEY`
+  refuses the run (reports a clean error, spends nothing) instead of silently using mock engines.
+- **Photo uploads capped** at 30 MB and image mime types only, set on the `photos` bucket by
+  migration `0002` (no dashboard step needed).
+
 ## H1 limitations (deliberate)
 
 - **No storyboard review hosted** (runs go straight through; the review UI stays local-only for now). The review checkbox is hidden in hosted builds.
-- **No billing**: your API keys pay for every run. Do not invite strangers beyond people you trust; there are no per-user quotas yet (H2).
+- **No billing**: your API keys pay for every run. The caps above bound the blast radius, but
+  still only invite people you trust; real per-user credit accounting is H2.
 - **No demo mode hosted**: real photos required.
-- **Higgsfield concurrency**: the account allows 2 concurrent generation jobs, so two users generating at once will queue. One-customer ceiling until the plan is upgraded.
+- **Higgsfield concurrency**: the account allows 2 concurrent generation jobs. Global
+  serialization means multiple users' runs queue behind each other (a run takes ~20 min), which
+  is the correct tradeoff for the alpha until the plan is upgraded.
 
 ## Env var matrix
 

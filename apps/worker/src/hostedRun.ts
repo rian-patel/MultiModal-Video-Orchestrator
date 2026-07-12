@@ -10,6 +10,7 @@ import {
   SupabaseBlobStore,
   SupabaseProgressSink,
   SupabaseProjectStore,
+  SupabaseRunLedger,
   type SupabaseLike,
 } from '@rev/hosted';
 import { LocalUploadEngine, type SourceFile } from '@rev/engine-upload';
@@ -69,12 +70,24 @@ export async function hostedRun(payload: GenerateTourPayload, client?: SupabaseL
   const photosBucket = new SupabaseBlobStore(supabase, 'photos');
   const artifacts = new SupabaseBlobStore(supabase, 'projects');
   const sink = new SupabaseProgressSink(supabase);
+  const ledger = new SupabaseRunLedger(supabase);
   const sync = new ArtifactSync(artifacts, payload.userId);
 
   const scratch = await mkdtemp(join(tmpdir(), 'rev-worker-'));
   const config = { ...defaultConfig, projectsDir: scratch };
   let projectId = payload.resume?.projectId ?? '';
   const ids = () => ({ runId: payload.runId, projectId, userId: payload.userId });
+
+  // Hosted has no mock mode: a worker missing its keys would otherwise burn
+  // Higgsfield credits on mock-classified shots or ship un-audited clips.
+  // Fail fast, and report it as a normal run failure so the user sees why.
+  if (!process.env.ANTHROPIC_API_KEY || !process.env.HIGGSFIELD_API_KEY) {
+    const message = 'Service temporarily unavailable (worker is missing its API keys). No credits were spent.';
+    await sink.emit(ids(), { type: 'run-error', data: { message } }).catch(() => {});
+    await ledger.finish(payload.runId, 'error').catch(() => {});
+    await rm(scratch, { recursive: true, force: true }).catch(() => {});
+    throw new Error('hosted worker misconfigured: ANTHROPIC_API_KEY and HIGGSFIELD_API_KEY are required');
+  }
 
   try {
     const shared = {
@@ -146,11 +159,14 @@ export async function hostedRun(payload: GenerateTourPayload, client?: SupabaseL
       rooms: done.map((s) => s.roomType),
     };
     await sink.emit(ids(), { type: 'complete', data: complete });
+    // Release the run so it stops counting against the user's active cap.
+    await ledger.finish(payload.runId, 'complete', project.id).catch(() => {});
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await sink
       .emit(ids(), { type: 'run-error', data: { message, projectId: projectId || undefined } })
       .catch(() => {});
+    await ledger.finish(payload.runId, 'error', projectId || undefined).catch(() => {});
     throw err;
   } finally {
     await rm(scratch, { recursive: true, force: true }).catch(() => {});

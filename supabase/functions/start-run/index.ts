@@ -5,6 +5,7 @@
 // bytes. Runs in Deno on Supabase; deploy with `supabase functions deploy`.
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 import { corsHeaders, json } from '../_shared/cors.ts';
+import { gateRun, newRunId, releaseRun, reserveRun, serviceClient, triggerTask } from '../_shared/enqueue.ts';
 
 // Keep in sync with packages/engine-upload (MIN_PHOTOS/MAX_PHOTOS).
 const MIN_PHOTOS = 10;
@@ -54,29 +55,24 @@ Deno.serve(async (req) => {
     return json({ error: 'logo path must be your own upload' }, 403);
   }
 
-  const runId = `run_${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`;
-  const trigger = await fetch(
-    `${Deno.env.get('TRIGGER_API_URL') ?? 'https://api.trigger.dev'}/api/v1/tasks/generate-tour/trigger`,
-    {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${Deno.env.get('TRIGGER_SECRET_KEY')}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        payload: {
-          runId,
-          userId: user.id,
-          fresh: {
-            targetDurationSec: target,
-            photos,
-            branding: body.branding,
-          },
-        },
-      }),
-    },
-  );
+  // Per-user spend caps (service role so the ledger cannot be user-forged).
+  const svc = serviceClient();
+  const gate = await gateRun(svc, user.id);
+  if (!gate.ok) return json({ error: gate.error }, gate.status);
+
+  const runId = newRunId();
+  await reserveRun(svc, runId, user.id, 'fresh');
+
+  // No concurrencyKey: the task's global concurrencyLimit:1 serializes ALL
+  // runs so at most one run's 2 in-flight clips hit Higgsfield's 2-job plan
+  // ceiling at a time. A per-user key would let N users run N*2 jobs at once.
+  const trigger = await triggerTask({
+    runId,
+    userId: user.id,
+    fresh: { targetDurationSec: target, photos, branding: body.branding },
+  });
   if (!trigger.ok) {
+    await releaseRun(svc, runId);
     const detail = (await trigger.text()).slice(0, 300);
     return json({ error: `could not enqueue the run: ${trigger.status} ${detail}` }, 502);
   }

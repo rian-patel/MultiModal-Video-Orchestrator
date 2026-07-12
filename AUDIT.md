@@ -291,7 +291,24 @@ rewrite. The architecture is carrying its weight.
 
 ## 6. What was fixed during this audit
 
-Nothing. Per the audit brief, no code was changed: the single candidate for an immediate hotfix
-(S1) requires a coordinated client+server change and is P1, not an emergency, because the server
-binds loopback and runs only during development sessions. Every finding above is captured in the
-roadmap and in CLAUDE.md's outstanding-issues section.
+The audit itself changed no code. **The four P0 hosted gates were then implemented in a
+follow-up (2026-07-12, before any hosted account exists), items 1-4 above:**
+
+- **#1 (S2) per-user spend caps:** `runs` ledger table (migration `0002`), reserved by the edge
+  functions via the service role (users cannot forge it), gated by the pure `evaluateRunGate`
+  policy (`supabase/functions/_shared/runs.ts`, unit-tested): max 1 active run/user, 20/day, with
+  a 2h stale window so a crashed worker never wedges a user. The worker marks the row terminal
+  (`SupabaseRunLedger`).
+- **#2 (S3) duplicate-resume double-bill:** the `generate-tour` task now has
+  `queue.concurrencyLimit: 1` (global serialization: two triggers for the same project can never
+  execute at once), plus an `idempotencyKey` on resume triggers as belt-and-suspenders. Chosen
+  over a per-user concurrency key so total in-flight Higgsfield jobs stay at the account's 2-job
+  ceiling.
+- **#3 (S4) worker mock fallback:** `hostedRun` fails fast when either API key is missing,
+  reporting a clean run-error and spending nothing.
+- **#4 (S5) storage caps:** migration `0002` sets the photos bucket to 30 MB / image mime types
+  only (code, not a dashboard step).
+
+67 tests pass (6 new). Remaining findings (S1, S6-S10, all architecture/quality/product items)
+stay in the roadmap; none were changed. The next milestone is now unblocked on code and waits
+only on account creation + one live E2E run.

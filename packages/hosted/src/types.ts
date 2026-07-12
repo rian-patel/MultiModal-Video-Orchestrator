@@ -7,11 +7,16 @@ export interface DbResult<T = unknown> {
   error: { message: string } | null;
 }
 
-/** The query-builder subset we use: upsert, and select-eq-maybeSingle. */
+/** The query-builder subset we use: upsert, insert, select, and update-eq. */
 export interface TableLike {
   upsert(values: Record<string, unknown>): PromiseLike<DbResult>;
   insert(values: Record<string, unknown>): PromiseLike<DbResult>;
+  update(values: Record<string, unknown>): UpdateLike;
   select(columns?: string): SelectLike;
+}
+
+export interface UpdateLike {
+  eq(column: string, value: unknown): PromiseLike<DbResult>;
 }
 
 export interface SelectLike {

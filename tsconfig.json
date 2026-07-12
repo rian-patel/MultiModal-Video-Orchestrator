@@ -15,5 +15,5 @@
       "@rev/hosted": ["packages/hosted/src/index.ts"]
     }
   },
-  "include": ["packages/**/*.ts", "scripts/**/*.ts", "apps/server/src/**/*.ts", "apps/worker/src/**/*.ts", "apps/worker/trigger.config.ts"]
+  "include": ["packages/**/*.ts", "scripts/**/*.ts", "apps/server/src/**/*.ts", "apps/worker/src/**/*.ts", "apps/worker/trigger.config.ts", "supabase/functions/_shared/runs.ts", "supabase/functions/_shared/runs.test.ts"]
 }
