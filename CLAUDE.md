@@ -1,378 +1,376 @@
 # Real Estate Cinematic Video Generator
 
-> **Read this first every session.** It is the source of truth for architecture, conventions, and current build phase. Update it as the project evolves.
+> **Read this first every session.** This file is the single source of truth for vision,
+> architecture, security requirements, standards, status, and roadmap. A full engineering audit
+> (2026-07-11, commit `c6ec6d5`) lives in **AUDIT.md**; its priorities are mirrored in the
+> roadmap below. Update both as the project evolves. Do not use em dashes in any writing here or
+> elsewhere in this project (user preference).
 
-## What we're building
+## 1. Vision and product shape
 
-A **local-first web app** (desktop-wrappable later via Tauri/Electron) that turns 10–40 property photos into a single cinematic real-estate tour video with almost no user input:
+Turn 10-40 property photos into one cinematic real-estate tour video with almost no user input:
+drag photos in, pick 30/45/60s, click Generate. The pipeline classifies every photo (room type,
+quality), orders a logical house tour, writes fidelity-constrained motion prompts, animates each
+photo via Higgsfield image-to-video, audits every clip against its source photo so fabrications
+never ship, and stitches a crossfaded, exactly-timed 1080p MP4 (plus a 9:16 vertical cut and
+optional agent branding).
 
-1. User drags in 10–40 photos.
-2. User picks a length: **30 / 45 / 60 s**.
-3. User clicks **Generate**.
-4. The app auto-analyzes each photo (what room it is), orders them into a logical house tour, writes cinematic motion prompts, animates each photo via **Higgsfield** (image→video), stitches the clips with **FFmpeg**, and presents a downloadable MP4.
+Two delivery modes, one codebase:
 
-Design goal: **maximum automation, minimum input.** And **modular from day one** — every stage is an independent, swappable engine.
+- **Local-first** (the original): browser UI + local Node server, user's own API keys, files on
+  disk. This is the dev/verification environment and the future Tauri desktop product.
+- **Hosted multi-user** (H1 alpha, built 2026-07): Vercel web + Supabase control plane
+  (auth/Postgres/Storage/Realtime) + Trigger.dev worker running the same pipeline. Invite-only,
+  owner's keys, no billing yet. Setup checklist: **HOSTING.md**. Business scoping (stacks,
+  unit economics ~$4-7 COGS per 30s tour on DoP, BYOK alternative):
+  claude.ai/code/artifact/fc5a4ff3-3dea-4972-9df2-5243a2067ba0.
 
-## Product shape & why
+The moat features: honest-by-construction video (fidelity audit), zero-input storyboarding, and
+review-before-spend.
 
-- **Local-first web app**: browser UI + local Node server. FFmpeg + large files need a real filesystem/process; runs on the user's machine with their own API keys → no hosting/auth/billing to build for the MVP.
-- **Desktop later**: wrap the same frontend+server in **Tauri** (preferred) or Electron. No architecture change — just packaging. (That's why we did NOT start in Electron.)
+## 2. Current status (2026-07-11)
 
-## Tech stack
+Working and verified end to end: upload (EXIF-normalize), Claude vision classification,
+rule-based storyboard with exact pacing, fidelity-first prompts, Higgsfield DoP v2 generation at
+motion strength 0.3 (Seedance native-1080p opt-in), Claude per-clip fidelity audit (drift =>
+clip dropped + regenerated on resume), FFmpeg render with branding cards/watermark + lanczos
+sharpening + 9:16 vertical, storyboard review screen (local), checkpointed resume that never
+re-bills a finished clip, live progress (SSE local / Realtime hosted), in-app preview + download.
+**61 unit tests** (node:test via tsx), typecheck clean across packages, server, worker, web.
 
-| Concern | Choice | Notes |
-|---|---|---|
-| Language | **TypeScript** everywhere | Vision is an API call, so no Python needed → one language. |
-| Monorepo | **npm workspaces** (pnpm not installed) | Run TS via **tsx** (no build step in dev). |
-| Frontend (Phase 1+) | React + Vite + Tailwind | Single-screen tool; no SSR needed. |
-| Backend (Phase 1+) | Fastify | REST + SSE progress streaming. |
-| Vision / room understanding | **Claude (vision)** via Anthropic API | One call → roomType + description + lighting + move + quality score. Swappable for local CLIP. |
-| Video generation | **Higgsfield** image→video | MCP connector available in-session for prototyping; production REST client behind same interface. |
-| Render | **FFmpeg** via `ffmpeg-static` (spawned directly; no fluent-ffmpeg) | Normalize+trim per clip, chained `xfade`, H.264 1080p CRF19. |
-| Persistence | JSON per project now → **SQLite** (`better-sqlite3`) later | Resumable job state. |
-| Concurrency | `p-queue` | Cap Higgsfield concurrency + retries. |
+Real artifacts produced: `projects/real-tour/tour.mp4` (first real tour), prototype clips under
+`projects/prototype/`. Higgsfield credits are real money: see 6.3 before touching videogen.
 
-## Architecture: independent engines enriching one shared `Project`
+Hosted H1 status: all repo-side code complete and unit-tested; **live E2E pends account creation**
+(Supabase/Trigger.dev/Vercel, HOSTING.md). Hosted launch is gated on the P0 items in section 9.
 
-Data flows down a pipeline. Each **engine** is a pure transform with a narrow, testable I/O. The **orchestrator** reads the needed slice of `Project`, calls the engine, writes the result back, persists, and emits progress. Engines never call each other — that's what makes them swappable.
+## 3. Architecture
+
+### 3.1 The pipeline
+
+Independent engines enrich one shared `Project` document. The orchestrator reads each engine's
+input slice, calls it, writes the result back, persists a checkpoint, emits progress. Engines
+never call each other.
 
 ```
-Upload → Vision → Storyboard → Prompt → VideoGen → Fidelity → Render → download
+Upload -> Vision -> Storyboard -> Prompt -> VideoGen -> Fidelity -> Render -> MP4 (+9:16)
+(sharp)   (Claude)  (rule-based)  (template) (Higgsfield) (Claude)   (FFmpeg)
 ```
 
-| Engine | Input → Output | MVP impl | Swap-in later |
+| Engine | Input -> Output | Real impl | Notes |
 |---|---|---|---|
-| **Upload** | `UploadRequest` → `Asset[]` | validate/persist/thumbnail | S3 adapter |
-| **Vision** | `Asset[]` → `VisionResult[]` | Claude vision | local CLIP, GPT-4V |
-| **Storyboard** | `{assets,vision,targetDurationSec}` → `Shot[]` | rule-based order + **select best N** + durations | LLM narrative order |
-| **Prompt** | `{shots,vision}` → `Shot[]` | vision-move + room-variant composer (see Phase 4 notes) | LLM prompts |
-| **VideoGen** | `{shots,assets}` → `Shot[]` | Higgsfield (submit/poll/download) | Runway/Kling/Luma |
-| **Fidelity** | `{shots,assets}` → `Shot[]` | Claude audits clip frames vs source photo; drift ⇒ shot 'failed' | frame-diff heuristics |
-| **Render** | `{shots,outputPath,branding?}` → `RenderResult` | FFmpeg (+cards/watermark/9:16) | Remotion |
+| Upload | `UploadRequest` -> `Asset[]` | `upload:local` (sharp) | EXIF-rotate, normalize JPEG q92, true dims, 320px thumbs |
+| Vision | `Asset[]` -> `VisionResult[]` | `vision:claude` | structured outputs, <=1280px, concurrency 4, per-image fallback |
+| Storyboard | `{assets,vision,target}` -> `Shot[]` | `storyboard:rule-based` | quality floor, coverage-first selection, exact pacing |
+| Prompt | `{shots,vision}` -> `Shot[]` | `prompt:template` | fidelity-first: no scene description, neutral moves |
+| VideoGen | `{shots,assets}` -> `Shot[]` | `videogen:higgsfield` | DoP v2 + strength lever; Seedance opt-in |
+| Fidelity | `{shots,assets}` -> `Shot[]` | `fidelity:claude` | frame audit vs source; drift => shot 'failed'; fail-open |
+| Render | `{shots,outputPath,branding?}` -> `RenderResult` | `render:ffmpeg` | xfade chain, cards, watermark, vertical |
 
-(Fidelity runs *inside* the videogen stage checkpoint — no new `ProjectStage`; a
-dropped clip is a per-shot 'failed', which render skips and resume regenerates.)
+Fidelity runs inside the videogen checkpoint (no extra stage); render skips non-'done' shots, so
+a dropped clip means a shorter honest tour, never a crash.
 
-### The Engine contract (`@rev/core`)
+Engine contract (`@rev/core`):
 ```ts
-interface Engine<TIn, TOut> {
-  readonly name: string;
-  process(input: TIn, ctx: EngineContext): Promise<TOut>;
-}
+interface Engine<TIn, TOut> { readonly name: string; process(input: TIn, ctx: EngineContext): Promise<TOut>; }
 // EngineContext = { workDir, config, logger, progress(pct, msg) }
 ```
 
-### The shared spine: `Project` (`@rev/core`)
-`Project` carries `assets`, `vision`, `shots`, `outputPath`, and a `stage`. `Shot` is the unit that flows through Storyboard→Render (order, roomType, durationSec, prompt, motionPreset, higgsfieldJobId, clipPath, status). See `packages/core/src/project.ts`.
+`Project` carries `assets`, `vision`, `shots`, `branding?`, `outputPath`, `verticalPath?`,
+`stage`, `lastError?`. `stage` is a **checkpoint**: it advances only when that stage's output is
+on disk. `nextStage()` maps any saved project to the first stage still to run; resume skips
+finished work and, within videogen, keeps shots whose clips exist (never re-pay). Failure keeps
+the stage and records `lastError`. Not resumable: stage 'created'. Upload is never re-run;
+`workDir/source/` is the durable artifact.
 
-### Storyboard is the "brains" of low-input UX (`storyboard:rule-based`, Phase 3 final)
-Three passes, all in `packages/engine-storyboard/src/index.ts` (unit-tested in `index.test.ts`, `npm test`):
-1. **Quality floor** (`config.storyboard.minQualityScore`, 0.3): junk photos are dropped, not padded in — a shorter, better video wins. All photos below floor → clear error (surfaces as SSE run-error). Drops are warned via the progress message.
-2. **Selection**: coverage first (best photo of each distinct room in tour order), then quality fill with a **per-room cap** (`maxShotsPerRoom`, 2) so one photogenic room can't dominate, then uncapped overflow only if slots remain.
-3. **Exact pacing**: smallest n with per-clip ≤ `clipDurationSec` covering the target — `n = ceil((target − xfade)/(clip − xfade))` — then per-clip durations via **cumulative rounding** so the cut sums to the target exactly (30/45/60 → 7/11/14 clips; render trims clips, never extends). Too few photos → full-length clips, shorter video + warning.
-- **Canonical tour order**: exterior_front → foyer → living_room → kitchen → dining → primary_bedroom → bedroom → bathroom → office → outdoor → aerial (`roomPriority.ts`). Deterministic (idx tie-breaker).
-- Debug: `npm run storyboard <projectId> [targetSec]` replays storyboard+prompt on a saved project's vision data — tune selection without re-paying vision API calls.
-
-## Folder structure
+### 3.2 Repository layout
 
 ```
 packages/
-  core/              @rev/core — Project model, Engine<> contract, config, logger, id,
-                     shared SSE event types (events.ts — wire format for server+web)
-  engine-upload/     @rev/engine-upload
-  engine-vision/     @rev/engine-vision
-  engine-storyboard/ @rev/engine-storyboard
-  engine-prompt/     @rev/engine-prompt
-  engine-videogen/   @rev/engine-videogen
-  engine-fidelity/   @rev/engine-fidelity — post-videogen hallucination audit
-  engine-render/     @rev/engine-render
-  orchestrator/      @rev/orchestrator — pipeline runner + persistence + progress
-  hosted/            @rev/hosted — Supabase adapters for hosted mode (project store,
-                     blob store, progress sink, path rebase + artifact sync)
+  core/              Project model, Engine contract, config, logger, ids, SSE wire types (events.ts)
+  engine-upload/     sharp normalize (+ MIN/MAX_PHOTOS constants)
+  engine-vision/     Claude structured-output classification
+  engine-storyboard/ selection + paceDurations (also used by review re-pacing)
+  engine-prompt/     fidelity-first prompt composer (templates.ts)
+  engine-videogen/   Higgsfield client (DoP v2 + Seedance), MOTION_IDS catalog map
+  engine-fidelity/   frame audit (claude.ts, frames.ts ffmpeg sampling)
+  engine-render/     ffmpeg graph builder, cards.ts (SVG->PNG branding), vertical derivation
+  orchestrator/      runPipeline/resumePipeline, persistence, onCheckpoint mirror hook
+  hosted/            Supabase adapters: project store (JSONB), blob store, progress sink,
+                     rebaseProjectPaths + ArtifactSync (cross-worker resume)
 apps/
-  server/            @rev/server — Fastify (port 3001): REST + SSE, wired to the pipeline
-                     (main.ts, app.ts, runs.ts = in-memory RunRegistry w/ replay buffer,
-                      routes/health.ts, routes/runs.ts, paths.ts = repo-root resolution)
-  worker/            @rev/worker — Trigger.dev task `generate-tour` (hostedRun.ts glue:
-                     hydrate from Supabase -> runPipeline -> mirror checkpoints/artifacts)
-supabase/            migrations/0001_init.sql (projects, run_events, buckets, RLS) +
-                     functions/{start-run,resume-run} (Deno edge functions; NOT in the
-                     root tsconfig — they typecheck under Deno, not Node)
-  web/               @rev/web — React 19 + Vite + Tailwind v4 (port 5173, /api proxied
-                     to 3001): App.tsx, api.ts (SSE client), components/{Dropzone,
-                     LengthSelector, BrandingSection (collapsible; agent identity
-                     persisted in localStorage), ProgressBar, ResultCard (video preview
-                     + master/vertical downloads), ReviewScreen (reorder/remove/approve)}
-scripts/demo.ts      runs the full pipeline on fake data (no server needed)
-projects/<id>/       per-run working dir: source/ clips/ output/ project.json  (gitignored)
+  server/            Fastify 127.0.0.1:3001, REST + SSE, in-memory RunRegistry w/ replay
+  web/               React 19 + Vite + Tailwind v4 (5173, /api proxied). Hosted mode switches on
+                     via VITE_SUPABASE_URL (SignIn, storage upload, Realtime watch)
+  worker/            Trigger.dev task `generate-tour` (hostedRun.ts glue); retries disabled
+supabase/            migrations/0001_init.sql (RLS, buckets) + Deno edge functions
+                     start-run / resume-run (NOT in root tsconfig; Deno-typed)
+scripts/             demo, analyze, storyboard-preview, render, smoke/prototype/audit tools
+projects/<id>/       per-run working dir: source/ thumbs/ clips/ branding/ output/ project.json (gitignored)
+AUDIT.md             full 2026-07-11 engineering audit  ·  HOSTING.md hosted setup checklist
 ```
 
-### Server API (stable shape)
-- `GET  /api/health` → `HealthData { ok, service, engines: { vision: claude|mock, videogen: higgsfield|mock, fidelity: claude|mock } }` — which impls the next run will use (key-gated); the UI header displays it.
-- `POST /api/runs` — two content types (both accept a **review** flag: multipart field
-  `review=1` / JSON `review: true` → run pauses at the 'prompted' checkpoint and emits
-  SSE `review` instead of animating straight through — no clip spend until approval):
-  - `multipart/form-data`: real photos. Fields: `targetDurationSec` (30|45|60) +
-    `photos` file parts (10–40, ≤30 MB each) + optional branding text fields
-    (`address`, `agentName`, `phone`, `email`) and a `logo` file part. Streamed to
-    `%TMP%/rev-uploads/<id>/`, run through the real `LocalUploadEngine` (engine
-    override), temp dir removed in `trackRun`'s finally (the orchestrator copies the
-    logo into `workDir/branding/` first, so resumes never depend on the temp dir).
-    → `202 { runId, photoCount }`. Bad count/duration → 400.
-  - `application/json` `{ targetDurationSec, branding? }`: demo mode — built-in
-    14-name set through the mock Upload Engine (branding = text fields only).
-    → `202 { runId }`.
-- `GET  /api/runs/:id` → snapshot `{ id, status, projectId, lastEvent }` (projectId set as soon as the project exists, not only on success).
-- `GET  /api/runs/:id/events` → SSE. Event names: `progress`, `review`, `complete`,
-  `run-error` (NOT `error` — that's reserved by EventSource). Replays buffered events
-  to late subscribers, so reconnects recover the full history. `complete` carries
-  `videoUrl` (+ `verticalUrl` when a 9:16 cut exists) + shot count/rooms of
-  **successful** shots only; `review` carries
-  `ReviewEventData` (shots w/ prompts+thumbUrls, benched photos, pacing config) and is
-  terminal for that run's stream; `run-error` carries `projectId?` (what enables Resume
-  in the UI). The web client also handles EventSource giving up (server restarted
-  mid-run → 404 → readyState CLOSED) with a "lost connection" error.
-- `GET  /api/projects/:id/storyboard` → `ReviewEventData` for the saved project (409 before Storyboard has run).
-- `PATCH /api/projects/:id/storyboard` `{ assetIds: string[] }` — the new tour, in
-  order (omitting = removing); subset of current shots, no dups. Re-paces durations via
-  `paceDurations` (exported by engine-storyboard: exact target at the ideal clip count,
-  full-length clips otherwise) and saves. Only while stage is 'prompted' (409 otherwise).
-- `GET  /api/projects/:id/thumb/:assetId` → 320px JPEG thumbnail (404 for mock/demo assets).
-- `POST /api/projects/:id/resume` → `202 { runId, projectId, resumeFrom }` — re-runs a
-  persisted project from its last checkpoint (semantics below). 404 unknown project,
-  409 if already complete or upload never finished. Same SSE contract as a normal run.
-- `GET  /api/projects/:id/video` → streams the finished MP4 (default: 16:9 master;
-  `?variant=vertical` = the 9:16 social cut, 409 if none, 400 for unknown variants).
-  Single-range `Range:` support (206/416 — required for `<video>` seeking);
-  `?download` adds `content-disposition: attachment;
-  filename="tour-<len>s[-vertical].mp4"`. 409 before render.
+### 3.3 Hosted mode (H1) data flow
 
-### Resume semantics (Phase 7, in `@rev/orchestrator`)
-`project.stage` is a **checkpoint**: it only advances when that stage's output is on
-disk ('generating'/'rendering' are written just *before* their stage starts). On
-failure the stage is left alone and the reason goes to `project.lastError` — there is
-no 'error' stage anymore. `nextStage(project)` maps any saved project to the first
-stage still to run; `resumePipeline({ projectId })` skips completed stages. Within
-videogen, shots whose `status === 'done'` clip file still exists are kept and only the
-rest go to the engine ("Resuming: N/M clips already generated") — finished Higgsfield
-clips are never re-paid for. If videogen fails outright on resume but kept clips
-exist, the failure downgrades to per-shot 'failed' and the partial tour still renders.
-Not resumable: stage 'created' (original upload bytes are gone) and legacy 'error'
-projects. Upload is never re-run — `workDir/source/` is the durable artifact.
+Browser signs in (magic link, signups disabled = invite-only) -> uploads photos directly to the
+`photos` bucket under `<uid>/...` (storage RLS enforces the prefix) -> `start-run` edge function
+validates counts/ownership and triggers the Trigger.dev task -> worker downloads inputs to a
+scratch dir, runs the unmodified pipeline, mirrors every checkpoint (`onCheckpoint`) to the
+`projects` table (whole Project as JSONB + promoted columns) and artifacts to the `projects`
+bucket (`ArtifactSync.push`) -> progress rows in `run_events` (browser: select for replay +
+Realtime for live tail) -> terminal `complete` event carries `storage://` keys the browser swaps
+for short-lived signed URLs. Resume: `resume-run` edge fn -> worker hydrates the row, rebases all
+absolute paths onto its scratch dir (`rebaseProjectPaths`), pulls sources/kept clips, resumes.
+Hosted has no review flow and no demo mode yet (see roadmap #7/#8).
 
-### Vision Engine (real, `vision:claude` in packages/engine-vision/src/claude.ts)
-One Claude call per photo: `claude-opus-4-8`, **structured outputs** (`output_config.format` json_schema — guaranteed-valid JSON, schema in `schema.ts`), image downscaled to ≤1280px JPEG before sending (cost), concurrency 4, SDK `maxRetries: 3`. **Per-image failure isolation**: an unanalyzable photo gets a conservative default (`other`, q=0.3) instead of failing the run; a non-property image is classified `other` with q≈0.05 by the prompt's own rules, so Storyboard benches it. Model/concurrency/dim configurable via constructor. Server uses it for multipart runs **only when `ANTHROPIC_API_KEY` is set** (loaded from `.env` via `process.loadEnvFile` in main.ts); demo/JSON runs always stay mock. NOTE: `@anthropic-ai/sdk` must be ≥0.110 for `output_config` typings.
+## 4. Engineering principles
 
-Debug view: `npm run analyze [dir]` — runs Claude vision on any folder of photos (no server, no 10-photo minimum) and prints the room/quality/lighting/move table. Default dir: `test-photos/`. Real photos for testing live in `test-photos-real/` (gitignored).
+1. **Engines are pure, narrow, swappable.** New domain logic lands in `packages/`, never directly
+   in `apps/server` or `apps/worker`. The apps are transports.
+2. **Checkpoints are sacred.** A stage advances only when its output is durable. Anything that
+   weakens resume semantics is a regression, no matter what it improves.
+3. **Money-safety invariants** (enforced in code and tests, keep them that way):
+   a billed Higgsfield job is never resubmitted (submit/poll retry split); finished clips are
+   never regenerated (resume keeps them); whole-task retries are disabled hosted; the fidelity
+   audit fails open (an audit error never destroys a paid clip).
+4. **Fidelity over spectacle.** The product must not misrepresent the property. Prompts carry no
+   scene description and no directional targets; the platform prompt-enhancer stays off; motion
+   strength stays low on DoP; every clip is audited. A dropped clip beats a shipped fabrication.
+5. **Fail per-item, not per-run.** One bad photo/clip degrades output; it does not crash the run.
+6. **Verify live before trusting a vendor claim.** The Higgsfield knowledge in 6.3 exists because
+   probing found the docs wrong or silent (data-URI rejection, `prompts` array trap, fake motion
+   support). Prototype one clip before any schema change ships.
+7. **Two modes, one truth.** Wire types live in `@rev/core/events.ts`. Domain math (pacing,
+   review) must have exactly one implementation.
 
-### Upload Engine (real, `upload:local` in packages/engine-upload/src/local.ts)
-Per photo: sharp `.rotate()` (applies EXIF orientation) → normalized JPEG q92 in
-`workDir/source/<assetId>.jpg` → true post-rotation dims onto `Asset` → 320px thumb
-in `workDir/thumbs/`. Downstream engines can assume upright, consistent JPEGs.
-Non-image bytes fail the run with a per-file message.
+## 5. Security requirements
 
-## Fidelity: reducing property hallucination on the generative path
+Posture verified by the audit; keep these true:
 
-Real-estate video must **not invent or alter the property** (inventing furniture/rooms/
-features is a legal liability). Root cause found live: an image-to-video model
-synthesizes new pixels for any area a camera move reveals; a *translational* move
-(dolly-in/orbit/crane) toward a prompt-named target ("dolly-in toward the dining room")
-makes it fabricate that target — it invented a dining table in the dolly path even
-though the real one sat off through a doorway. Prompt design amplified it (declarative
-scene descriptions + directional moves).
+- Local server binds `127.0.0.1` only. No CORS is configured on it (the Vite proxy makes the
+  browser same-origin); do not add permissive CORS.
+- All process spawning is `spawn(bin, argsArray)` with no shell. User text never enters a filter
+  graph or command string. SVG card text is XML-escaped (test-covered).
+- Uploads: validated by parsing (sharp re-encode), never by MIME/extension; multipart caps
+  (40 files, 30 MB each); temp dirs removed in `finally`; sharp's default pixel limit stays on.
+- Secrets: `.env` is gitignored (never committed; audit-verified). Keys are never logged. Hosted
+  keys live on the services (Trigger.dev env, Supabase secrets, Vercel env), never in the repo.
+- Hosted: every table and bucket has owner-scoped RLS; edge functions derive identity from the
+  verified JWT only; the worker uses the service role but re-checks project ownership; users
+  never receive service credentials; artifacts are served via short-lived signed URLs.
+- Path handling: project ids validated `/^[\w-]+$/`; filenames pass `basename()` + allowlist;
+  storage paths validated against the caller's own prefix.
+- Known open items (do not consider these solved; roadmap numbers): local CSRF hardening (#5),
+  hosted spend caps (#1), duplicate-run concurrency (#2), worker key fail-fast (#3), Supabase
+  object-size cap (#4).
 
-A deterministic "Ken Burns" (pan/zoom over the real photo) engine was trialed as a
-guaranteed-faithful default but **removed — the output quality was unacceptable**. The
-generative Higgsfield path is the product; we harden it toward fidelity instead:
+## 6. Operational knowledge (hard-won, keep current)
 
-- **Fidelity-first Prompt engine** (`packages/engine-prompt`): emits NO declarative scene
-  description (the image is the sole authority on contents — this is what stops the model
-  inventing named furniture/rooms), only a neutral **non-directional** camera move
-  (`safeMovePhrase`, never "toward X" — a named destination is what the model synthesizes
-  toward) + lighting + a hard `FIDELITY_CONSTRAINT` on every prompt ("do not add, remove,
-  move, or invent any furniture, objects, rooms … keep every existing object unchanged").
-  Vision's photo-specific move still selects the motion *preset*, but its free-text
-  (which may name a destination) never reaches the prompt.
-- **`enhance_prompt: false`** in the Higgsfield submit body — disables the platform's
-  prompt "enhancer" (it embellishes and invents detail). On the v2 endpoint the field is
-  schema-validated (bool), so it is guaranteed honored.
-- **Low motion strength (v2 endpoint, 2026-07)**: videogen now submits to
-  `POST /v1/image2video/dop` with `motions: [{id, strength}]`, default **strength 0.3**
-  (`HIGGSFIELD_MOTION_STRENGTH`, 0..1). Less camera travel = less occluded geometry the
-  model must synthesize = less room to invent. Verified live on the living-room photo
-  that caused the original hallucination: all visible content preserved (no people, no
-  invented furniture/rooms); residual drift confined to door-reveal details.
-- **Fidelity engine backstop** (`fidelity:claude`, `packages/engine-fidelity`): after
-  videogen, Claude compares 4 sampled frames per clip (1 anchor near t=0 + 3 across the
-  back half, ≤1568px) against the source photo (structured verdict faithful|drift, rubric
-  tuned for materiality: people/added furniture/layout changes/contradicting reveals =
-  drift; softness/lighting/text-morph/plausible sliver continuations = fine). Drift ⇒
-  shot 'failed' → skipped from the cut; resume regenerates it (flag `fidelityChecked`
-  skips re-audits of kept clips; regenerated shots shed the flag). FAIL-OPEN: an audit
-  error keeps the paid clip, unflagged, for a later re-audit. Wired when
-  `ANTHROPIC_API_KEY` is set; demo/keyless runs use the pass-through `fidelity:mock`.
-  Verified live on the prototype clip: correctly caught a genuinely invented
-  hearth-like fixture in a door reveal (verdict 'drift' — that clip would be
-  regenerated). Known limit: it can misread nested-doorway geometry and cite a real
-  object as missing, biasing strict — costs a regen, never ships a fabrication.
-  Auditor false-positive rate should be watched on the next full real run.
+### 6.1 External services and keys
 
-**Residual risk** — a generative model always has latitude; strength 0.3 + the audit
-make drift rare and caught, not impossible.
+- `ANTHROPIC_API_KEY` (.env): vision + fidelity. Claude SDK >= 0.110 for `output_config` typings.
+  Model: `claude-opus-4-8` for both (cost-tiering to Sonnet/Haiku is roadmap #10 adjacent).
+- `HIGGSFIELD_API_KEY` (.env): format `keyId:secret` from **cloud.higgsfield.ai** /api-keys
+  (separate credit pool from the consumer MCP subscription). ~5 credits per DoP clip; plan allows
+  **2 concurrent jobs** (observed live; a real multi-user ceiling).
+- Optional: `HIGGSFIELD_MODEL` = dop-turbo | dop-lite | dop-preview (720p, strength lever) |
+  seedance_pro | seedance_lite (native 1080p, ~3.5x cost, prompt-driven camera).
+  `HIGGSFIELD_MOTION_STRENGTH` (0..1, default 0.3, DoP only). `FFMPEG_PATH` overrides
+  ffmpeg-static everywhere (hosted workers get it from Trigger.dev's ffmpeg extension).
+- FFmpeg via `ffmpeg-static`, spawned directly (never fluent-ffmpeg).
 
-## External dependencies / keys
+### 6.2 Fidelity system (why the product is trustworthy)
 
-- `ANTHROPIC_API_KEY` — Claude vision. **Set in `.env` (gitignored) since Phase 2.**
-- `HIGGSFIELD_API_KEY` — video generation, from **cloud.higgsfield.ai** (`/api-keys` after sign-in) — separate product/credit pool from the consumer subscription the MCP connector uses; `platform.higgsfield.ai` is an API-only host with no dashboard UI, not the signup page. Engine auto-activates when set. Format documented as `key:secret` as of Phase 5's prototyping (see below) — reverify against the dashboard's actual output before first real run, since Higgsfield's own docs describe a single bearer token. MCP connector remains usable in-session for prototyping.
-- Optional videogen tuning: `HIGGSFIELD_MODEL` (dop-turbo | dop-lite | dop-preview) and
-  `HIGGSFIELD_MOTION_STRENGTH` (0..1, default 0.3 — the fidelity lever).
-- FFmpeg bundled via `ffmpeg-static` (Phase 6) — no system install.
-- Copy `.env.example` → `.env`.
+Root cause of hallucination (found live): i2v models synthesize pixels for any area a camera move
+reveals; translational moves toward a prompt-named target fabricate that target (the invented
+dining table). Levers, all live:
+1. Prompts carry **no scene description** and only neutral **non-directional** moves
+   (`safeMovePhrase`, hard `FIDELITY_CONSTRAINT` appended to every prompt). Vision free-text
+   never reaches the prompt (it picks the motion preset only).
+2. `enhance_prompt: false` on every submit (schema-validated on v2).
+3. **Motion strength 0.3** on DoP (less travel = less invented geometry). Verified on the
+   originally-hallucinating photo.
+4. **Audit backstop** (`fidelity:claude`): 4 frames/clip (anchor near t=0 + 3 across the back
+   half, <=1568px) vs the source photo; materiality rubric (people/added furniture/layout/
+   contradicting reveals = drift; softness/lighting/text-morph/plausible sliver continuations =
+   fine). Drift => shot 'failed' => skipped in render, regenerated on resume (`fidelityChecked`
+   flag skips re-audits of kept clips; regenerated shots shed it). FAIL-OPEN on audit errors.
+   Verified catching a real invented fixture and a real invented person. Auditor bias is strict;
+   FP rate unmeasured (roadmap #10). A Ken Burns fallback was tried and removed (quality).
 
-## Dev commands
+### 6.3 Higgsfield platform API (probed live 2026-07; docs are incomplete)
+
+- Auth header: `Authorization: Key <keyId>:<secret>`.
+- **Image input is never a data URI** (422 url_too_long, 2083-char cap). Flow:
+  `POST /files/generate-upload-url {content_type}` -> `{upload_url, public_url}` -> `PUT` bytes
+  -> submit `public_url`.
+- **DoP v2**: `POST /v1/image2video/dop` `{ params: { prompt, input_images:[{type:'image_url',
+  image_url}], model: dop-lite|dop-preview|dop-turbo (default turbo), motions:[{id:UUID,
+  strength:0..1}], seed?, enhance_prompt } }` -> job-set `{id, jobs:[...]}`. No duration param
+  (~5s clips, 1280x720@30 fixed; no resolution params exist). Motion catalog:
+  `GET /v1/motions` (121 presets, stable UUIDs, mapped in `MOTION_IDS`). Poll via the legacy
+  `GET /requests/{id}/status` (accepts v2 ids) -> `{status, video.url}`; also
+  `GET /v1/job-sets/{id}`. Schema discovery trick: FastAPI 422 errors enumerate fields when you
+  POST empty/wrong-typed bodies.
+- **Seedance** (`/v1/image2video/seedance`): `{ params: { prompts: string[] (a bare `prompt` is
+  SILENTLY DROPPED; the promptless clip invented a person), input_image:{...} (singular),
+  model: seedance_pro|seedance_lite, resolution:'480'|'720'|'1080', duration:3..12,
+  aspect_ratio:'16:9'|'9:16'|..., camera_fixed:bool (DEFAULT TRUE; false lets the camera carry
+  motion), motion_id: rejected for every catalog UUID ("Motion not found"), enhance_prompt } }`.
+  Output 1920x1088@24, ~69s/clip, visibly crisper. Camera move rides in the prompt text.
+- Kling (`kling-v2-1[-master]`, duration 5|10) and Minimax (resolution up to 1080, duration 6|10)
+  exist at `/v1/image2video/{kling,minimax}`; schemas probed, never run.
+- **No video-upscale model exists on the API-key pool** (probed every plausible route);
+  `upscale_video` is consumer-MCP only.
+- Latency: DoP ~5 min/clip typical, ~16 min observed under load (maxPollMs 20 min); 7-photo tour
+  = 13.2 min wall. Retry split: obtaining a request id is retryable; poll/download is never
+  retried (billing).
+
+### 6.4 Render facts
+
+Normalize chain: lanczos scale + pad + `unsharp=5:5:0.30` (720p sources stay crisp at 1080p),
+fps=30, settb, trim to shot duration; chained `xfade` (offset_k = sum(dur) - k*xfade); H.264
+CRF19 `+faststart`. Branding: title card (address) + end card (agent/contact/logo) as sharp
+SVG->PNG looped image inputs in the same chain (CARD_SEC=3 each, so a 30s tour ships 34.5s);
+55%-opacity corner watermark timeline-enabled over the tour segment only; logo copied to
+`workDir/branding/` at run start (`adoptBranding`) so resume never needs upload temp dirs.
+Vertical 9:16 always derived from the finished master (blur-pad gblur=24 + slight darken).
+
+### 6.5 Server API (local, stable shape)
+
+- `GET /api/health` -> `{ok, service, engines:{vision, videogen, fidelity}}` (key-gated impls).
+- `POST /api/runs`: multipart (10-40 `photos`, `targetDurationSec` 30|45|60, optional branding
+  text fields + `logo` file, `review=1` flag) or JSON demo `{targetDurationSec, branding?,
+  review?}`. -> `202 {runId}`. Review runs park at 'prompted' (no clip spend) and emit SSE
+  `review`.
+- `GET /api/runs/:id` snapshot; `GET /api/runs/:id/events` SSE (`progress`/`review`/`complete`/
+  `run-error`; NEVER plain `error`, EventSource reserves it; replay buffer for late subscribers).
+- `GET|PATCH /api/projects/:id/storyboard` (PATCH only while stage 'prompted'; re-paces via
+  `paceDurations`); `GET .../thumb/:assetId`; `POST .../resume`; `GET .../video`
+  (Range/206 support, `?variant=vertical`, `?download`).
+- `complete` carries `videoUrl` (+`verticalUrl`), successful-shot count/rooms only.
+
+### 6.6 Storyboard brain
+
+Quality floor (`minQualityScore` 0.3) drops junk (all-drop = clear error). Selection: coverage
+first (best of each room in canonical order: exterior_front -> foyer -> living_room -> kitchen ->
+dining -> primary_bedroom -> bedroom -> bathroom -> office -> outdoor -> aerial), then quality
+fill with per-room cap 2, then overflow. Pacing: smallest n covering the target
+(n = ceil((target - xfade)/(clip - xfade)); 30/45/60s -> 7/11/14 clips), cumulative rounding sums
+exactly; too few photos = full-length clips + warning, never padding.
+
+## 7. Coding standards
+
+- TypeScript everywhere, ESM (`"type": "module"`), run via tsx (no build step in dev).
+- Cross-package imports use `@rev/*`; within a package, relative extensionless paths.
+- Each engine package exports one Engine class + its I/O types, nothing else. Mocks are named
+  `*:mock`; real engines get descriptive names (`render:ffmpeg`).
+- **apps/web may only `import type` from workspace packages** (their runtime uses Node builtins).
+  Browser-needed constants are mirrored with a "keep in sync" comment (consolidation: roadmap #16).
+- Wire types shared by server/web/worker live in `@rev/core/events.ts` only.
+- Tests: node:test via tsx, colocated `*.test.ts`. External APIs are tested with injected
+  `fetchImpl`/client slices, never live. Every money-path change needs a test. Run
+  `npm test` + `npm run typecheck` before any commit.
+- The server resolves `projects/` from the repo root (`apps/server/src/paths.ts`), never cwd.
+- Comments explain constraints the code can't show (billing rules, vendor traps), not narration.
+- No em dashes in any prose, docs, comments, or commit messages.
+- Commits: conventional-ish (`feat(scope):`, `docs:`), Co-Authored-By Claude trailer, push to
+  `main` after tests pass (user-established practice).
+
+## 8. Design constraints (locked)
+
+- Higgsfield is the i2v vendor (engine seam makes alternatives one engine away; do not build a
+  multi-vendor abstraction speculatively).
+- Default model dop-turbo: **user chose cost over 1080p** (2026-07). Seedance stays one env var
+  away. No music (user opted out; revisit only if asked). No video upscaling (does not exist on
+  the API pool).
+- Clip length (5s) and crossfade (0.75s) are config (`packages/core/src/config.ts`); duration
+  math must keep summing exactly if they change.
+- Per-shot failure isolation everywhere: a 5-of-6 video beats a crash.
+- JSON project document is the pipeline's source of truth (file locally, JSONB row hosted);
+  promoted columns exist for querying. Do not grow more JSON-blob consumers than the worker.
+- Local-first stays fully functional with zero keys (mock engines + real render produce a
+  playable MP4). Hosted has no mock mode (worker must fail fast, roadmap #3).
+
+## 9. Roadmap (prioritized; reasoning in AUDIT.md section 5)
+
+**Next implementation milestone: "Safe to invite" = items 1-4 + HOSTING.md account wiring + one
+live hosted E2E run.** Then H1.5 = items 7-8 (hosted review). Then H2 = Stripe credit packs +
+quotas UI + fidelity-informed pricing.
+
+P0 (gate on the first hosted invite; local is unaffected today):
+1. Per-user run caps + active-run limit in the edge functions (uncapped third-party spend).
+2. Project-keyed concurrency (Trigger.dev queue key, concurrency 1) + reject duplicate resume
+   (double-billing race).
+3. Hosted worker fails fast when ANTHROPIC/HIGGSFIELD keys are missing (no mock mode hosted).
+4. Supabase max-object-size cap configured + added to HOSTING.md.
+
+P1:
+5. Local CSRF/rebinding hardening: require a custom header on mutating routes + Host allowlist.
+6. CI workflow: `npm ci && npm run typecheck && npm test` + `npm audit --audit-level=high` on push.
+7. Extract review/pacing/`buildReviewData` domain logic out of `apps/server/routes/runs.ts` into
+   a package (unblocks hosted review; deletes mirrored math in ReviewScreen).
+8. Hosted review-before-spend flow (worker honors `stopAfter`, review event over run_events, edit
+   + approve edge function).
+9. Tests for engine-upload (EXIF, junk rejection) and vision `sanitize()`.
+10. Measure fidelity-audit false-positive rate on a full real batch (`scripts/audit-clip.ts`).
+
+P2:
+11. Multipart `files: 41` boundary fix (40 photos + logo currently rejected).
+12. Atomic `saveProject` (tmp + rename).
+13. Unify `keyedEngines`/`hostedEngines`/`defaultEngines` into `buildEngines(mode)`.
+14. Test-runner glob instead of the hand-maintained file list in package.json.
+15. Worker `maxDuration` -> 10800; pass injected route `config` into review-data building.
+16. Move MIN/MAX_PHOTOS + size limits into `@rev/core` (kill hand-mirroring).
+17. Hosted UX table stakes: completion email, "my tours" list.
+
+P3: RunRegistry eviction; fidelity progress sub-stage labeling; `pan` motion mapping semantics;
+MockRenderEngine keep-or-delete decision; logger levels/redaction; ToS + AI-content disclosure
+page; pin sharp/ffmpeg-static exact versions; tighten edge-function CORS to the Vercel origin;
+full real-photo browser-UI run to shake out UX gaps; Tauri desktop packaging; beat-aware pacing.
+
+## 10. Outstanding issues and technical debt
+
+- **Known bugs:** roadmap #11 (40-photos+logo rejection). Cosmetic: global progress bar rewinds
+  during the fidelity phase (audit A5).
+- **Debt, accepted knowingly:** persistence-as-module-functions with the `onCheckpoint` mirror
+  bolt-on (future `ProjectStore` port, audit A1); three engine-wiring copies (#13); constant
+  mirroring (#16); `storage://` URL convention on shared event types (audit A9); RunRegistry
+  unbounded growth (#P3); non-atomic project.json writes (#12).
+- **Unmeasured:** fidelity FP rate (#10); Seedance/Kling quality beyond single prototypes;
+  platform $/credit for the API pool (user should read it off the dashboard; consumer reference
+  ~$0.10-0.15/credit).
+- **Dependency watch:** `@opentelemetry/core` moderate advisory via @trigger.dev/core (worker
+  telemetry only); bump when Trigger.dev updates. Everything else clean at audit time.
+- **External blockers:** Higgsfield 2-concurrent-job plan ceiling (support conversation before
+  multi-user load); Higgsfield ToS review for resale vs BYOK (before H2 pricing).
+
+## 11. Dev commands
 
 ```bash
-npm install        # once, sets up workspace symlinks
-npm run demo       # full mock pipeline in the terminal (no server needed)
-npm run analyze [dir]  # Claude vision debug table on a folder of photos (default test-photos/)
-npm run storyboard <projectId> [targetSec]  # replay storyboard+prompts on a saved project (no API cost)
-npm test           # unit tests (node:test via tsx)
-npm run dev:server # Fastify API on http://127.0.0.1:3001 (tsx watch)
-npm run dev:web    # Vite UI on http://localhost:5173 (run in a second terminal)
-npm run typecheck  # tsc --noEmit: root project (packages+scripts+server) AND apps/web
+npm install            # once
+npm run demo           # full mock pipeline -> playable MP4, zero keys/cost
+npm run analyze [dir]  # Claude vision debug table (default test-photos/; real photos in test-photos-real/, gitignored)
+npm run storyboard <projectId> [targetSec]   # replay selection/prompts on saved vision data, no API cost
+npm run render <clipsDir> [out]              # stitch any folder of clips
+npx tsx scripts/smoke-higgsfield.ts          # ONE-clip live smoke test (spends ~5 credits) before any full run
+npx tsx scripts/audit-clip.ts <clip> <photo> # standalone fidelity audit of any clip
+npm test               # 61 tests; npm run typecheck  # root + web tsconfigs
+npm run dev:server     # Fastify on 127.0.0.1:3001
+npm run dev:web        # Vite on 5173 (second terminal)
 ```
 
-## Conventions
+Runtime verification recipes (launch, drive, credit-safety rules: JSON demo runs never spend):
+`.claude/skills/verify/SKILL.md`. Hosted setup: HOSTING.md.
 
-- ESM everywhere (`"type": "module"`). Cross-package imports use `@rev/*`; within a package use relative paths (extensionless, tsx/esbuild resolves).
-- Each engine exports one class implementing `Engine<TIn,TOut>` and its I/O types. Nothing else.
-- Mock engines are named `*:mock`; real ones get a descriptive name (e.g. `render:ffmpeg`). Swapping = pass a different engine into `runPipeline({ engines: {...} })`.
-- Orchestrator persists `project.json` after every stage → runs are resumable.
-- **apps/web may only `import type` from workspace packages** — their runtime code uses Node built-ins (e.g. `node:crypto` in core's id.ts) that don't exist in the browser. Runtime constants needed by the UI (e.g. 10–40 photo limits) are mirrored locally with a "keep in sync" comment.
-- Types shared between server and web (SSE payloads etc.) live in `@rev/core` `events.ts` so the wire format can't drift.
-- The server resolves `projects/` from the repo root via `apps/server/src/paths.ts` (import.meta.url), never from cwd.
+## 12. History (compressed; full detail in git log and AUDIT.md)
 
-## Roadmap (build incrementally, one phase per prompt)
-
-- [x] **Phase 0** — Monorepo, `core`, mock orchestrator running all 6 engines on fake data end-to-end.
-- [x] **Phase 1a — full-stack scaffold** — Fastify server (REST + SSE + RunRegistry) + React/Vite/Tailwind UI (dropzone, 30/45/60 selector, Generate, live progress bar, result card) wired to the mock pipeline end-to-end. Verified in a real browser (Playwright): Generate → SSE progress → "Tour complete". No business logic: upload sends file *names* only, engines are Phase 0 mocks.
-- [x] **Phase 1b — real Upload Engine** — `LocalUploadEngine` (sharp: EXIF rotate, normalize to JPEG, true dims, thumbnails), `@fastify/multipart` streaming on the server, UI sends real File bytes as FormData. Demo mode (no files) still uses the mock engine — first real use of the engine-swap mechanism. Verified: curl multipart (12 JPEGs incl. an EXIF-orientation-6 case → correctly 1000x1600) and full browser upload via Playwright. `scripts/make-test-photos.ts` regenerates test fixtures into `test-photos/` (gitignored).
-- [x] **Phase 2 — Vision Engine (Claude)** — `ClaudeVisionEngine` (opus-4-8, structured outputs, downscale, concurrency 4, per-image fallback) + `npm run analyze` debug CLI + server auto-swap when key present. Verified on real property photos: kitchen/living_room/outdoor correctly classified q≈0.9 with vivid descriptions that flow into prompts; solid-color junk correctly scored `other` q=0.05; full server E2E run mixed-quality photos correctly. `ANTHROPIC_API_KEY` now set in `.env`.
-- [x] **Phase 3 — Storyboard Engine (final)** — quality floor (drops junk, warns, errors if nothing usable), coverage-first selection with per-room cap 2 + overflow, exact-duration pacing via cumulative rounding (45s target now renders 45.00s, not 43.25s). 8 unit tests (`npm test`, node:test via tsx — first tests in the repo). `npm run storyboard <projectId>` preview tool. Verified against the real-photo project proj_5e627dec: 4 good photos → clean 17.75s tour + "shorter than requested" warning instead of a junk-padded 43s one.
-- [x] **Phase 4 — Prompt Engine** — **NOTE: prompt shape superseded by the fidelity-first
-  rewrite (see the "Fidelity" section above).** Originally `"<Scene>. Camera: <move>.
-  <Lighting> light; <mood>. <style suffix>"` with Vision's description + directional move
-  in the prompt — that scene description + "toward X" move is exactly what caused the
-  dining-table hallucination. Now: no scene description, neutral `safeMovePhrase`, and a
-  hard `FIDELITY_CONSTRAINT`. Vision's `suggestedMove` still selects the motion preset
-  (`presetFromMove`); per-room variants fall back/rotate; identical back-to-back moves
-  auto-vary. Tests rewritten to assert the anti-hallucination guarantees.
-- [x] **Phase 5 — VideoGen Engine (Higgsfield)** — Prototyped via MCP: kitchen photo + Phase 4 prompt → real 5s clip (`projects/prototype/kitchen-dolly-in.mp4`, model `cinematic_studio_video_v2`, 5 credits, sound off; balance was 191 credits, kling3_0=7.5cr, seedance=17.5cr). Production `HiggsfieldVideoGenEngine` (`videogen:higgsfield`) targets the platform REST API (docs.higgsfield.ai): `POST /{model}` `{image_url(data URI), prompt, duration}` w/ `Authorization: Key key:secret` → poll `GET /requests/{id}/status` (queued|in_progress|completed|failed|nsfw) → download `video.url` to `workDir/clips/`. Concurrency 3, 2 attempts/shot, per-shot failure isolation (all-fail → error). Default model `higgsfield-ai/dop/standard` (override via `HIGGSFIELD_MODEL`). 5 unit tests w/ injected fetch. Server swaps it in when `HIGGSFIELD_API_KEY` (format `key:secret`) is in `.env`. VideoGen input widened to `{shots, assets}` (engine needs source images). **REST path now verified live (2026-07)** — see the Higgsfield-integration note below; the original data-URI image assumption was wrong and has been fixed to a CDN upload. Submit endpoint since migrated to v2 for motion strength (Phase 9a).
-
-### Higgsfield integration — verified & gotchas (2026-07)
-- **Auth** `Authorization: Key <keyId>:<secret>` — the dashboard (cloud.higgsfield.ai/api-keys) issues a Key ID + Secret; join with a colon in `HIGGSFIELD_API_KEY`. Confirmed working (a bad image got 422 on the body, not 401).
-- **v2 endpoint (current path, probed + verified live 2026-07):**
-  `POST /v1/image2video/dop` `{ params: { prompt, input_images: [{type:'image_url',
-  image_url}], model: 'dop-turbo'|'dop-lite'|'dop-preview' (default dop-turbo),
-  motions: [{ id: <UUID>, strength: 0..1 }], seed?, enhance_prompt } }` → returns a
-  job-set `{ id, jobs: [...] }`. **The legacy `GET /requests/{id}/status` route accepts
-  the v2 id** (same `{status, video.url}` shape), so polling/download are unchanged.
-  There is **no duration param** (clips are ~5s, matching `clipDurationSec`). Motion
-  catalog: `GET /v1/motions` (121 presets, stable UUIDs — mapped from our motionPreset
-  names in `MOTION_IDS`, engine-videogen/higgsfield.ts). Unknown/legacy model values are
-  normalized to `dop-turbo`. Schema was discovered by probing FastAPI 422 validation
-  errors — empty/wrong-typed bodies enumerate fields; useful trick for their other
-  endpoints. dop-turbo prototype clip: 1280x720@30, ~5 min wall.
-- **Image input is NOT a data URI.** The platform rejects data-URI `image_url` with **HTTP 422 `url_too_long`** (2083-char cap). Real flow (from the official SDK, `npm pack higgsfield-client`): `POST /files/generate-upload-url {content_type}` → `{upload_url, public_url}`, then `PUT` raw bytes to `upload_url` (presigned; only `Content-Type` header), then submit `public_url` as `image_url`. Implemented as `uploadImage()` in `higgsfield.ts`.
-- **Latency & retry (fixed):** `dop/standard` ≈ a few min/clip, occasionally ~16 min under load. Default `maxPollMs` is 20 min. `generateShot` splits retry into two phases: obtaining a request_id (upload + submit) is retried (a failure there predates any billable job — e.g. a transient CDN 502), but poll + download is **never** retried, so a slow clip is never resubmitted/double-billed. So the default `maxAttempts: 2` is credit-safe.
-- **Fidelity (`enhance_prompt: false`):** the submit body disables the platform prompt-enhancer to curb invented detail (see the "Fidelity" section). Verified accepted by the DoP endpoint.
-- **Cost/timing seen:** 7-photo → 6/7 clips (one transient 502 on the upload-url step, isolated & skipped — pre-submit, so no credit), stitched to 25.83s 1080p in **13.2 min wall**. `scripts/smoke-higgsfield.ts` = one-clip live smoke test to run before any full run. First real tour: `projects/proj_99799c3f/output/tour.mp4`.
-- [x] **Phase 6 — Render Engine (FFmpeg)** — `FfmpegRenderEngine` (`render:ffmpeg`): per-clip normalize (scale+pad to config.resolution, fps=30, settb) + trim to shot.durationSec, chained `xfade` transitions (offset_k = Σdur − k·xfade), H.264 CRF19 `+faststart`, progress parsed from stderr `time=`. `buildXfadeGraph` + `probeDurationSec` exported (used by tests/scripts). Spawns `ffmpeg-static` directly — NOT fluent-ffmpeg (unmaintained; direct filter_complex control). Mock videogen now emits REAL color MP4s via ffmpeg, and `defaultEngines()` uses the real render — keyless `npm run demo` produces a playable 45.03s MP4. `npm run render <clipsDir> [out]` stitches any folder of clips. 5 render tests (2 run real ffmpeg + probe duration). **First real tour shipped: `projects/real-tour/tour.mp4`** (17.93s, 1080p, 4 real Higgsfield clips of the user's photos, crossfaded). Discovered live: starter plan = max 2 concurrent Higgsfield jobs → engine default concurrency now 2. Credits: 171 left (spent 20 total on 4 clips @ 5cr). Music + branding overlays deferred to Phase 7/8 (no licensed music assets yet).
-- [x] **Phase 7 — wiring, resume, preview + download** — `stage` became a resume checkpoint (`lastError` replaces the 'error' stage); `resumePipeline`/`nextStage` in orchestrator skip finished stages and, within videogen, keep shots whose clips exist on disk (never re-pay Higgsfield); videogen total-failure on resume downgrades to per-shot 'failed' when kept clips exist. New routes: `POST /api/projects/:id/resume`, `GET /api/projects/:id/video` (Range + `?download`); health reports key-gated engine wiring. UI: in-app `<video>` preview + Download MP4 button (ResultCard), "Resume from last checkpoint" button on error, engine line in header, EventSource connection-loss surfaced. 9 new tests (orchestrator resume + server routes, `buildApp({ projectsDir })` for test injection). Verified live: browser demo run → playing/seeking 1080p video; tampered project (3 of 7 clips deleted, stage='generating') resumed via API — "Resuming: 4/7 clips already generated", kept clips' mtimes untouched. Project verify recipe saved to `.claude/skills/verify/SKILL.md`.
-- [x] **Phase 8 — storyboard review screen** — a run started with `review: true` stops at the 'prompted' checkpoint (SSE `review` event, run status 'review') **before any clip spend**; the UI shows the planned tour (thumbnails or room-color swatches for demo, motion preset chips, vision descriptions, benched photos) with reorder/remove/restore; "Animate" = `PATCH /api/projects/:id/storyboard` (re-paces via the newly exported `paceDurations`) + the existing resume endpoint — approval is just Phase 7's resume from 'prompted'. "Review first" checkbox in the UI, default ON. 4 new tests (37 total). Verified live over HTTP: 30s demo review run → reversed + dropped a shot → 26.25s plan → resumed → rendered MP4 probed at 26.27s in the user's custom order.
-- [x] **Fidelity pass (2026-07)** — diagnosed/fixed the property-hallucination bug (model
-  fabricated a dining table). Prompt engine rewritten fidelity-first (no scene description,
-  neutral non-directional moves, hard `FIDELITY_CONSTRAINT`) and `enhance_prompt: false` on
-  the Higgsfield submit. A guaranteed-faithful Ken Burns engine was trialed as default but
-  **removed — quality was unacceptable**; Higgsfield (hardened) stays the product path.
-- [x] **Phase 9a — fidelity levers (2026-07)** — both levers landed. (1) VideoGen migrated
-  to the v2 endpoint (`POST /v1/image2video/dop`): motion presets mapped to catalog UUIDs
-  (`MOTION_IDS`), **motion strength default 0.3** (`HIGGSFIELD_MOTION_STRENGTH`),
-  schema-validated `enhance_prompt:false`, legacy status route reused for polling (v2 ids
-  accepted), legacy model names normalized to `dop-turbo`. Prototype
-  (`scripts/prototype-dop-v2.ts`, clip in `projects/prototype/`) verified low strength
-  keeps the previously-hallucinating living-room shot faithful. (2) New
-  **`@rev/engine-fidelity`** audit stage (see the Fidelity section): Claude frame audit,
-  drift ⇒ per-shot 'failed', fail-open, `fidelityChecked` resume semantics; wired in
-  orchestrator (`PipelineEngines.fidelity`, inside the videogen checkpoint), server
-  (key-gated), health + UI header. 4 new tests (45 total); live-audit of the prototype
-  clip correctly flagged its invented hearth fixture.
-- [x] **Phase 10 — branded deliverable + vertical (2026-07)** — turning the silent 16:9
-  clip into something an agent can post. (1) **Branding overlays**: optional `Branding`
-  on `Project` (address/agentName/phone/email/logoPath); Render composes a title card
-  (address headline) + end card (agent, phone·email, logo) as sharp SVG→PNG image
-  inputs in the same xfade chain (each `CARD_SEC`=3s, so a 30s tour ships as 34.5s),
-  plus a 55%-opacity corner logo watermark timeline-enabled over the tour segment only
-  (`packages/engine-render/src/cards.ts`; user text XML-escaped). Logo is copied into
-  `workDir/branding/` at run start (`adoptBranding`) so resume never depends on upload
-  temp dirs. UI: collapsible BrandingSection, agent identity kept in localStorage.
-  (2) **9:16 vertical** (`tour-vertical.mp4`): always derived from the finished master —
-  blur-pad (gblur=24 + slight darken) behind the centered 16:9 band; zero extra credits.
-  Served via `?variant=vertical`; second download button in ResultCard. (3) **Video
-  upscale: NOT integrable** — probed the platform API 2026-07 (`v1/upscale/video` and
-  every plausible route → "Model not found"); `upscale_video` exists only on the
-  consumer MCP subscription, not the API-key pool. Revisit if Higgsfield ships it.
-  8 new tests (53 total). Verified over HTTP: branded 30s demo → 34.5s master
-  (cards eyeballed correct) + 1080x1920 vertical, both stream w/ Range + download names.
-- [x] **Phase 10a — video quality investigation (2026-07)** — root cause of soft output:
-  **DoP is hard-capped at 1280x720** (no resolution params — probed) and render was
-  stretching it to 1080p with bicubic. Fixes landed: (1) free render sharpening —
-  `flags=lanczos` + `unsharp=5:5:0.30` in the normalize chain. (2) **Seedance support**
-  (`HIGGSFIELD_MODEL=seedance_pro|seedance_lite`, opt-in): the platform quietly hosts
-  premium i2v models at `/v1/image2video/{kling,seedance,minimax}`; Seedance does
-  **native 1080p** (1920x1088@24fps, ~69s/clip vs DoP's ~5min) at ~3.5x DoP's per-clip
-  cost. **Seedance traps (verified live, cost a clip):** a bare `prompt` field is
-  SILENTLY DROPPED (must be `prompts: string[]`) — the promptless clip invented a
-  person walking through the living room, which `scripts/audit-clip.ts` (new: standalone
-  fidelity audit of any clip) correctly flagged DRIFT; DoP's motion catalog is rejected
-  ("Motion not found") so the camera move rides in the prompt text; `camera_fixed`
-  defaults true (model then animates scene contents instead — that's when the person
-  appeared). Corrected clip (prompts array + camera_fixed:false): faithful (audit
-  verdict FAITHFUL), deliberate dolly-in, visibly crisper 1:1 than DoP.
-  **Decision: default stays dop-turbo (user chose cost over 1080p);** Seedance is one
-  env var away. Kling (`kling-v2-1[-master]`, 5|10s) + Minimax (1080p, 6s min) exist
-  but are unprobed beyond schema. No video-upscale model exists on the API-key pool.
-- [x] **Phase H1 — hosted multi-user alpha, repo side (2026-07)** — same code, two modes
-  (scoping memo: claude.ai/code/artifact/fc5a4ff3-3dea-4972-9df2-5243a2067ba0). Stack:
-  Vercel (web) + Supabase (auth/Postgres/Storage/Realtime = control plane) + Trigger.dev
-  (pipeline worker; no timeouts) + owner's API keys, invite-only, no billing (that's H2).
-  What landed: `onCheckpoint` hook on Run/ResumeOptions (mirrors every persisted
-  checkpoint; failure-path mirror errors are swallowed so they can't mask the real
-  error); FFMPEG_PATH env override in all 3 ffmpeg call sites (Trigger.dev's ffmpeg()
-  build extension provides a system binary); **@rev/hosted** (SupabaseProjectStore =
-  Project JSONB + promoted columns, SupabaseBlobStore, SupabaseProgressSink =
-  run_events rows replacing the SSE registry, rebaseProjectPaths = absolute-path remap
-  so resume works across ephemeral workers, ArtifactSync push/pull with
-  essential-vs-optional semantics); worker task `generate-tour` (retries hard-disabled:
-  a task retry would re-bill every clip — recovery is the resume flow); edge functions
-  start-run/resume-run (ownership via RLS-scoped select; photos validated to the
-  caller's own storage prefix); web hosted mode keyed off VITE_SUPABASE_URL (magic-link
-  SignIn, storage upload, Realtime watchRun with replay-by-select + dedupe,
-  `storage://` URLs signed client-side; review checkbox hidden — review flow is
-  local-only for now); gated GitHub Action deploy-hosted.yml (inert until
-  ENABLE_HOSTED_DEPLOY=true). 6 new tests (61 total). **Setup checklist: HOSTING.md.**
-  NOT yet done: live E2E against real Supabase/Trigger.dev accounts (needs user
-  account creation), hosted storyboard review, per-user quotas.
-- [ ] **Phase 10b+ / H2** — (a) measure fidelity-audit false-positive rate on a full
-  real run. (b) beat-aware pacing + music — **user opted out of music for now**
-  (revisit only if asked; no licensed assets). (c) Tauri desktop packaging. (d) full
-  real-photo run through the browser UI (upload→review→generate→download) to shake out
-  UX gaps. (e) H1 live verification once accounts exist, then H2: Stripe credit packs,
-  per-user quotas, hosted review flow.
-
-## Key decisions (locked for MVP)
-
-- All-TypeScript; Vision = Claude (revisit if offline classification needed).
-- Higgsfield for i2v; prototype via MCP connector, then REST client behind `Engine` interface.
-- Clip length & crossfade are **config** (`packages/core/src/config.ts`) so duration math stays correct if Higgsfield options change.
-- Per-shot failure isolation: a failed clip is skipped, not fatal — a 5-of-6 video beats a crash.
+Phases 0-8 built the mock-to-real pipeline: monorepo + engine contract; Fastify+React scaffold;
+real upload; Claude vision; storyboard selection/pacing; prompt composer; Higgsfield REST client
+(live-verified, first real tour `projects/real-tour/tour.mp4`); FFmpeg render; resume semantics +
+preview/download; review screen. The 2026-07 fidelity arc: diagnosed live hallucination, rewrote
+prompts fidelity-first, migrated to DoP v2 for motion strength 0.3, added the fidelity audit
+engine (caught a real invented fixture and an invented person). Phase 10: branding cards +
+watermark + 9:16 vertical; quality investigation (DoP 720p cap found, lanczos+unsharp fix,
+Seedance wired opt-in, user kept DoP for cost). Phase H1: hosted multi-user skeleton (Supabase +
+Trigger.dev + Vercel), full audit (AUDIT.md), this document restructure.
